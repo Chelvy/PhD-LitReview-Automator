@@ -1,0 +1,56 @@
+# Credentials & secrets — NEVER commit these
+.env
+*.json
+!package.json
+config/google_service_account.json
+config/google_credentials.json
+config/google_token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# Storage (local DB — not committed; use cloud storage in prod)
+storage/pipeline_state.db
+storage/papers_db.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Outputs (large; version-controlled in Google Docs)
+outputs/daily_reports/*.html
+outputs/daily_reports/*.pdf
+
+# LangSmith cache
+.langsmith/
