@@ -35,8 +35,12 @@ from typing import Any, Literal
 import structlog
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.graph import CompiledGraph
+try:
+    from langgraph.graph.graph import CompiledGraph
+except ImportError:
+    from langgraph.graph.state import CompiledStateGraph as CompiledGraph  # type: ignore
 
 from config.settings import settings
 from state.pipeline_state import PipelineState
@@ -390,10 +394,17 @@ def build_pipeline(
     # ── Compile with persistence ─────────────────────────────────────────
     db_path = checkpointer_path or settings.sqlite_db_path
 
-    import os
+    import os, sqlite3
     os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
 
-    checkpointer = SqliteSaver.from_conn_string(db_path)
+    # SqliteSaver requires a direct sqlite3 connection (not from_conn_string context manager)
+    try:
+        _conn = sqlite3.connect(db_path, check_same_thread=False)
+        checkpointer = SqliteSaver(_conn)
+    except Exception:
+        # Fallback to in-memory saver for environments where SQLite write fails
+        logger.warning("sqlite_checkpointer_fallback", reason="Using InMemorySaver")
+        checkpointer = InMemorySaver()
 
     # Interrupt before document updates for human review (optional)
     interrupt_nodes = ["document_update"] if (
