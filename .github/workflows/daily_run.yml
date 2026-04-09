@@ -1,0 +1,177 @@
+name: PhD LitReview Daily Pipeline
+
+on:
+  # ── Scheduled trigger: every day at 6:00 AM UTC ──────────────────────────
+  schedule:
+    - cron: "0 6 * * *"
+
+  # ── Manual trigger with optional dry-run flag ────────────────────────────
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (skip email and doc writes)"
+        type: boolean
+        default: false
+      log_level:
+        description: "Log level"
+        type: choice
+        options: [INFO, DEBUG, WARNING]
+        default: INFO
+      days_lookback:
+        description: "Days to look back for new papers"
+        type: number
+        default: 7
+
+env:
+  PYTHON_VERSION: "3.11"
+  PIPELINE_TIMEZONE: "UTC"
+
+jobs:
+  daily-litreview:
+    name: Daily Literature Review Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 90   # Hard limit: pipeline must complete in 90 minutes
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ── 2. Set up Python ───────────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      # ── 3. Install dependencies ────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Restore persistent storage (papers DB) ──────────────────────
+      # We cache the papers database to avoid reprocessing known papers
+      - name: Restore papers database
+        uses: actions/cache@v4
+        with:
+          path: |
+            storage/
+            outputs/literature_review.md
+            outputs/research_proposal.md
+            outputs/references.bib
+            outputs/visualizations/
+          key: litreview-storage-${{ github.run_number }}
+          restore-keys: |
+            litreview-storage-
+
+      # ── 5. Create required directories ─────────────────────────────────
+      - name: Create directories
+        run: |
+          mkdir -p storage outputs/daily_reports outputs/visualizations logs config
+
+      # ── 6. Write Google service account credentials (if configured) ────
+      - name: Write Google credentials
+        if: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON != '' }}
+        run: |
+          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > config/google_service_account.json
+
+      # ── 7. Run the pipeline ────────────────────────────────────────────
+      - name: Run LitReview Pipeline
+        env:
+          # LLM
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: "claude-sonnet-4-6"
+
+          # LangSmith observability
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: "phd-litreview-automator"
+          LANGSMITH_TRACING: "true"
+
+          # Academic APIs
+          SEMANTIC_SCHOLAR_API_KEY: ${{ secrets.SEMANTIC_SCHOLAR_API_KEY }}
+          ELICIT_API_KEY: ${{ secrets.ELICIT_API_KEY }}
+          SCITE_API_KEY: ${{ secrets.SCITE_API_KEY }}
+          SCHOLARCY_API_KEY: ${{ secrets.SCHOLARCY_API_KEY }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          CORE_API_KEY: ${{ secrets.CORE_API_KEY }}
+          OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
+          NCBI_EMAIL: ${{ secrets.NCBI_EMAIL }}
+          NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
+
+          # Google Docs
+          GOOGLE_SERVICE_ACCOUNT_FILE: "config/google_service_account.json"
+          LITREVIEW_GOOGLE_DOC_ID: ${{ secrets.LITREVIEW_GOOGLE_DOC_ID }}
+          PROPOSAL_GOOGLE_DOC_ID: ${{ secrets.PROPOSAL_GOOGLE_DOC_ID }}
+          AI_FAILURES_GOOGLE_DOC_ID: ${{ secrets.AI_FAILURES_GOOGLE_DOC_ID }}
+
+          # Email
+          EMAIL_BACKEND: ${{ secrets.EMAIL_BACKEND || 'smtp' }}
+          SMTP_HOST: "smtp.gmail.com"
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_CC: ${{ secrets.EMAIL_CC }}
+
+          # Pipeline config
+          MAX_PAPERS_PER_RUN: "50"
+          MIN_RELEVANCE_SCORE: "6.0"
+          DAYS_LOOKBACK: ${{ inputs.days_lookback || '7' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
+
+          # Paths
+          SQLITE_DB_PATH: "storage/pipeline_state.db"
+          PAPERS_DB_PATH: "storage/papers_db.json"
+          OUTPUTS_DIR: "outputs"
+
+        run: |
+          python main.py run \
+            ${{ inputs.dry_run == 'true' && '--dry-run' || '' }} \
+            --log-level ${{ inputs.log_level || 'INFO' }}
+
+      # ── 8. Commit updated outputs back to repo ─────────────────────────
+      - name: Commit updated documents and visualizations
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "PhD LitReview Bot"
+          git add \
+            outputs/literature_review.md \
+            outputs/research_proposal.md \
+            outputs/references.bib \
+            outputs/visualizations/ \
+            outputs/daily_reports/ \
+            storage/papers_db.json || true
+          git diff --staged --quiet || \
+            git commit -m "chore: daily litreview update $(date +%Y-%m-%d)"
+          git push || echo "Nothing to push"
+
+      # ── 9. Upload logs as artifact ─────────────────────────────────────
+      - name: Upload pipeline logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pipeline-logs-${{ github.run_number }}
+          path: |
+            logs/
+            outputs/daily_reports/*.html
+          retention-days: 30
+
+      # ── 10. Notify on failure ──────────────────────────────────────────
+      - name: Notify on pipeline failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Pipeline failure — ${new Date().toISOString().split('T')[0]}`,
+              body: `The daily litreview pipeline failed on run #${context.runNumber}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['pipeline-failure']
+            })

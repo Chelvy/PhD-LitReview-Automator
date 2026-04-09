@@ -1,0 +1,79 @@
+# PhD LitReview Automator — Python Dependencies
+# Framework: LangGraph (LangChain ecosystem) — selected as best-in-class for
+# stateful, iterative, multi-agent academic workflows (see BENCHMARKING.md)
+
+# ── Core LangGraph / LangChain ─────────────────────────────────────────────
+langgraph>=0.2.50
+langchain>=0.3.12
+langchain-core>=0.3.25
+langchain-anthropic>=0.3.5
+langchain-community>=0.3.12
+langchain-text-splitters>=0.3.3
+
+# ── LLM Providers ──────────────────────────────────────────────────────────
+anthropic>=0.40.0          # Claude claude-sonnet-4-6 primary LLM
+openai>=1.55.0             # Fallback / embedding alternative
+tiktoken>=0.8.0            # Token counting
+
+# ── Persistence / State ────────────────────────────────────────────────────
+langgraph-checkpoint-sqlite>=1.0.5   # SQLite checkpointer for local runs
+langgraph-checkpoint-postgres>=2.0.7 # PostgreSQL for cloud deployments (optional)
+sqlalchemy>=2.0.36
+aiosqlite>=0.20.0
+
+# ── Academic Search APIs ───────────────────────────────────────────────────
+semanticscholar>=0.8.4     # Semantic Scholar Python client
+arxiv>=2.1.3               # ArXiv API client
+habanero>=1.2.6            # CrossRef API client
+biopython>=1.84            # PubMed/Entrez API access
+requests>=2.32.3
+httpx>=0.28.0              # Async HTTP (Elicit, Scite, Scholarcy, Perplexity)
+aiohttp>=3.11.0
+
+# ── PDF Processing ─────────────────────────────────────────────────────────
+pypdf>=5.1.0
+pymupdf>=1.24.14           # Fast PDF extraction (fitz)
+pdfplumber>=0.11.4
+requests-html>=0.10.0
+
+# ── Google APIs ────────────────────────────────────────────────────────────
+google-api-python-client>=2.154.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.1
+google-auth>=2.36.0
+
+# ── Email ──────────────────────────────────────────────────────────────────
+secure-smtplib>=0.1.1
+jinja2>=3.1.4              # Email/document templates
+premailer>=3.10.0          # HTML email CSS inlining
+
+# ── Data Handling ──────────────────────────────────────────────────────────
+pydantic>=2.10.0
+pydantic-settings>=2.6.1
+python-dotenv>=1.0.1
+tinydb>=4.8.0              # Lightweight local paper database
+pandas>=2.2.3
+numpy>=2.1.3
+
+# ── Scheduling (local fallback) ────────────────────────────────────────────
+schedule>=1.2.2
+apscheduler>=3.10.4
+
+# ── Observability / Logging ────────────────────────────────────────────────
+langsmith>=0.1.147         # LangSmith tracing
+structlog>=24.4.0
+rich>=13.9.4               # Beautiful terminal output
+tenacity>=9.0.0            # Retry logic with exponential backoff
+
+# ── Utilities ──────────────────────────────────────────────────────────────
+python-dateutil>=2.9.0
+pytz>=2024.2
+beautifulsoup4>=4.12.3
+lxml>=5.3.0
+markdown>=3.7
+python-slugify>=8.0.4
+
+# ── Testing ────────────────────────────────────────────────────────────────
+pytest>=8.3.3
+pytest-asyncio>=0.24.0
+pytest-mock>=3.14.0
