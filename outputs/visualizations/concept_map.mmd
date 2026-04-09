@@ -1,0 +1,34 @@
+graph TD
+    IP["🔬 Integration Paradox"]
+    SLR["System-Level Reliability"]
+    CLR["Component-Level Reliability"]
+    TC["Trust Composition"]
+    IM["Interface Misalignment"]
+    HAI["Human-AI Handoff"]
+    RM["Runtime Monitoring"]
+    SDLC["SDLC Practices"]
+    REG["Regulation (EU AI Act)"]
+
+    IP --> SLR
+    IP --> CLR
+    SLR --> TC
+    SLR --> IM
+    SLR --> HAI
+    SLR --> RM
+    TC --> SDLC
+    IM --> SDLC
+    REG --> SDLC
+    CLR -.->|'Insufficient alone'| SLR
+
+    GAP1["GAP-1\n2 papers\ngrowing"]
+    style GAP1 fill:#ccf0d4
+    GAP2["GAP-2\n1 papers\nnascent"]
+    style GAP2 fill:#ffe0cc
+    GAP3["GAP-3\n2 papers\nemerging"]
+    style GAP3 fill:#d4f0cc
+    GAP4["GAP-4\n0 papers\nabsent"]
+    style GAP4 fill:#ffcccc
+    GAP5["GAP-5\n0 papers\nabsent"]
+    style GAP5 fill:#ffcccc
+    GAP6["GAP-6\n0 papers\nabsent"]
+    style GAP6 fill:#ffcccc
