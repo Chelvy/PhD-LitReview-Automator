@@ -24,17 +24,13 @@ from config.prompts import AgentPrompts
 from state.pipeline_state import PipelineState
 from tools.paper_db import PaperDatabase
 from tools.scite_tool import SciteTool
+from agents.llm_utils import build_llm
 
 logger = structlog.get_logger(__name__)
 
 
 def _build_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key,
-        temperature=0.15,
-        max_tokens=8096,
-    )
+    return build_llm(temperature=0.15, max_tokens=8096)
 
 
 def _analyze_paper(

@@ -61,11 +61,6 @@ class CrossRefTool:
             "query": query,
             "limit": min(limit, 100),
             "filter": {"from_pub_date": from_date},
-            "select": [
-                "DOI", "title", "author", "published", "abstract",
-                "container-title", "ISSN", "URL", "reference-count",
-                "is-referenced-by-count", "type", "subject",
-            ],
             "sort": "relevance",
         }
         if issn:

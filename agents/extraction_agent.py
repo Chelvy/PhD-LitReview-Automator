@@ -25,6 +25,7 @@ from config.settings import settings
 from config.prompts import AgentPrompts
 from state.pipeline_state import PipelineState
 from tools.scholarcy_tool import ScholarcyTool
+from agents.llm_utils import build_llm
 
 logger = structlog.get_logger(__name__)
 
@@ -32,12 +33,7 @@ MAX_ABSTRACT_TOKENS = 3000  # Characters for abstract-only extraction
 
 
 def _build_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key,
-        temperature=0.1,
-        max_tokens=8096,
-    )
+    return build_llm(temperature=0.1, max_tokens=8096)
 
 
 def _fetch_pdf_text(pdf_url: str, max_chars: int = 15000) -> Optional[str]:
