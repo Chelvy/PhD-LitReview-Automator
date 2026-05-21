@@ -61,6 +61,9 @@ TRACKED_AUTHORS = [
 ]
 
 
+_FALLBACK_MODEL = "claude-sonnet-4-6"
+
+
 def _build_llm() -> ChatAnthropic:
     return ChatAnthropic(
         model=settings.anthropic_model,
@@ -104,7 +107,10 @@ Return ONLY a JSON array of query strings, no explanation:
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
         queries = json.loads(content)
-        if isinstance(queries, list):
+        # Claude sometimes wraps the array in an object like {"search_queries": [...]}
+        if isinstance(queries, dict):
+            queries = queries.get("search_queries", queries.get("queries", next(iter(queries.values()), [])))
+        if isinstance(queries, list) and queries:
             logger.info("queries_generated_by_llm", count=len(queries))
             return queries
     except Exception as e:
@@ -175,6 +181,9 @@ Return ONLY a JSON array of objects (one per paper, in order):
                 content = content.split("```")[1].split("```")[0].strip()
 
             scores = json.loads(content)
+            # Handle dict-wrapped response e.g. {"scores": [...]}
+            if isinstance(scores, dict):
+                scores = next((v for v in scores.values() if isinstance(v, list)), [])
             for item in scores:
                 idx = item.get("paper_number", 1) - 1
                 if 0 <= idx < len(batch):
