@@ -78,7 +78,7 @@ def _generate_search_queries(llm: ChatAnthropic, run_date: str) -> list[str]:
     Use Claude to generate fresh, targeted search queries for today's run.
     Combines baseline queries with LLM-generated variations.
     """
-    system = SystemMessage(content=AgentPrompts.DISCOVERY.format(days_lookback=settings.days_lookback))
+    system = SystemMessage(content=AgentPrompts.DISCOVERY.replace("{days_lookback}", str(settings.days_lookback)))
 
     prompt = f"""Today is {run_date}. Generate 12 highly targeted search queries for
 academic databases (Semantic Scholar, ArXiv, OpenAlex) to discover papers published
