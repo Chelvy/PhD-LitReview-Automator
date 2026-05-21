@@ -32,9 +32,12 @@ logger = structlog.get_logger(__name__)
 GOOGLE_DOCS_BASE = "https://docs.google.com/document/d"
 
 
-def _build_llm() -> ChatAnthropic:
+_FALLBACK_MODEL = "claude-sonnet-4-6"
+
+
+def _build_llm(model: str | None = None) -> ChatAnthropic:
     return ChatAnthropic(
-        model=settings.anthropic_model,
+        model=model or settings.anthropic_model,
         api_key=settings.anthropic_api_key,
         temperature=0.3,
         max_tokens=4096,
@@ -75,7 +78,24 @@ Write only the reminder text, no JSON wrapper."""
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         return response.content.strip()
-    except Exception:
+    except Exception as e:
+        err_str = str(e)
+        if "400" in err_str or "invalid_request_error" in err_str.lower():
+            # Configured model may not be accessible on this API key tier.
+            # Retry once with the guaranteed-available fallback model.
+            if settings.anthropic_model != _FALLBACK_MODEL:
+                logger.warning(
+                    "contribution_reminder_model_400",
+                    configured_model=settings.anthropic_model,
+                    fallback=_FALLBACK_MODEL,
+                    hint="Set ANTHROPIC_MODEL=claude-sonnet-4-6 in .env if this repeats",
+                )
+                try:
+                    fallback_llm = _build_llm(_FALLBACK_MODEL)
+                    response = fallback_llm.invoke([HumanMessage(content=prompt)])
+                    return response.content.strip()
+                except Exception:
+                    pass
         return (
             f"Our study addresses {len([g for g, c in gap_coverage.items() if c == 0])} "
             f"gaps still unaddressed by the {stats.get('total_corpus', 0)}-paper corpus. "
