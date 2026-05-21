@@ -29,6 +29,7 @@ from tools.crossref_tool import CrossRefTool
 from tools.openalex_tool import OpenAlexTool
 from tools.elicit_tool import ElicitTool
 from tools.paper_db import PaperDatabase
+from agents.llm_utils import build_llm
 
 logger = structlog.get_logger(__name__)
 
@@ -61,16 +62,8 @@ TRACKED_AUTHORS = [
 ]
 
 
-_FALLBACK_MODEL = "claude-sonnet-4-6"
-
-
 def _build_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key,
-        temperature=0.2,
-        max_tokens=4096,
-    )
+    return build_llm(temperature=0.2, max_tokens=4096)
 
 
 def _generate_search_queries(llm: ChatAnthropic, run_date: str) -> list[str]:

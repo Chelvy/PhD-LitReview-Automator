@@ -29,6 +29,7 @@ from config.prompts import AgentPrompts
 from state.pipeline_state import PipelineState, DocumentUpdate, BibtexEntry
 from tools.paper_db import PaperDatabase
 from tools.google_docs import GoogleDocsTool
+from agents.llm_utils import build_llm
 
 logger = structlog.get_logger(__name__)
 
@@ -39,12 +40,7 @@ LATEX_LIT_REVIEW_PATH = "outputs/literature_review.tex"
 
 
 def _build_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key,
-        temperature=0.2,
-        max_tokens=16000,
-    )
+    return build_llm(temperature=0.2, max_tokens=16000)
 
 
 def _read_current_document(path: str) -> str:

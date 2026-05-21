@@ -26,6 +26,7 @@ from config.prompts import AgentPrompts
 from state.pipeline_state import PipelineState, EmailReport
 from tools.paper_db import PaperDatabase
 from tools.email_tool import EmailTool
+from agents.llm_utils import build_llm
 
 logger = structlog.get_logger(__name__)
 
@@ -36,12 +37,7 @@ _FALLBACK_MODEL = "claude-sonnet-4-6"
 
 
 def _build_llm(model: str | None = None) -> ChatAnthropic:
-    return ChatAnthropic(
-        model=model or settings.anthropic_model,
-        api_key=settings.anthropic_api_key,
-        temperature=0.3,
-        max_tokens=4096,
-    )
+    return build_llm(temperature=0.3, max_tokens=4096, model=model)
 
 
 def _generate_contribution_reminder(
