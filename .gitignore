@@ -2,6 +2,9 @@
 .env
 *.json
 !package.json
+# Pipeline outputs that ARE committed (by the weekly GitHub Actions job)
+!outputs/visualizations/*.json
+!storage/papers_db.json
 config/google_service_account.json
 config/google_credentials.json
 config/google_token.json
@@ -26,9 +29,9 @@ venv/
 env/
 .conda/
 
-# Storage (local DB — not committed; use cloud storage in prod)
+# Storage: the LangGraph checkpoints stay local; storage/papers_db.json is committed
+# (it is how weekly runs remember which papers they have already analyzed)
 storage/pipeline_state.db
-storage/papers_db.json
 
 # IDE
 .idea/

@@ -1,0 +1,217 @@
+name: Weekly Literature Review
+
+on:
+  # ── Scheduled trigger: every Monday at 06:17 UTC ─────────────────────────
+  # (off the top of the hour — GitHub delays or drops :00 schedules under load)
+  schedule:
+    - cron: "17 6 * * 1"
+
+  # ── Manual trigger (Actions tab → Weekly Literature Review → Run workflow) ─
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: no email, no document/database writes, nothing committed"
+        type: boolean
+        default: false
+      days_lookback:
+        description: "Days to look back for new papers (overlapping windows catch late-indexed papers)"
+        type: string
+        default: "21"
+      log_level:
+        description: "Log level"
+        type: choice
+        options: [INFO, DEBUG, WARNING]
+        default: INFO
+
+# GITHUB_TOKEN is read-only by default on new repositories.
+permissions:
+  contents: write   # commit updated documents and the paper database
+  issues: write     # open/update an issue when a run fails
+
+# Never run two pipelines at once — both would edit and push the same files.
+concurrency:
+  group: weekly-litreview
+  cancel-in-progress: false
+
+jobs:
+  litreview:
+    name: Literature review run
+    runs-on: ubuntu-latest
+    timeout-minutes: 330   # first runs can analyze ~50 papers; hosted runners allow 360
+
+    env:
+      PYTHON_VERSION: "3.11"
+      DRY_RUN: ${{ inputs.dry_run == true && 'true' || 'false' }}
+      LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
+      DAYS_LOOKBACK: ${{ inputs.days_lookback || vars.DAYS_LOOKBACK || '21' }}
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # full history so the results commit can be rebased before pushing
+
+      # ── 2. Python + dependencies ───────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 3. Fail fast with a clear message if the API key is missing ────
+      - name: Check required secrets
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error title=Missing secret::ANTHROPIC_API_KEY is not set. Add it under Settings → Secrets and variables → Actions (see scripts/setup_github_secrets.sh)."
+            exit 1
+          fi
+
+      # ── 4. Google service account (optional — enables Google Docs sync) ─
+      - name: Write Google service account credentials
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          mkdir -p config storage outputs/daily_reports outputs/visualizations logs
+          if [ -n "$GOOGLE_SERVICE_ACCOUNT_JSON" ]; then
+            printf '%s' "$GOOGLE_SERVICE_ACCOUNT_JSON" > config/google_service_account.json
+            echo "Google Docs sync enabled"
+          else
+            echo "GOOGLE_SERVICE_ACCOUNT_JSON not set — Google Docs sync disabled"
+          fi
+
+      # ── 5. Run the pipeline ────────────────────────────────────────────
+      # DRY_RUN is read from the job environment by config/settings.py.
+      - name: Run literature review pipeline
+        id: pipeline
+        env:
+          # LLM
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-opus-5-5' }}
+          ANTHROPIC_FALLBACK_MODEL: ${{ vars.ANTHROPIC_FALLBACK_MODEL || 'claude-sonnet-4-6' }}
+          ANTHROPIC_EFFORT: ${{ vars.ANTHROPIC_EFFORT }}
+
+          # LangSmith observability (enabled only when a key is configured)
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_TRACING: ${{ secrets.LANGSMITH_API_KEY != '' && 'true' || 'false' }}
+          LANGSMITH_PROJECT: phd-litreview-automator
+
+          # Academic APIs
+          SEMANTIC_SCHOLAR_API_KEY: ${{ secrets.SEMANTIC_SCHOLAR_API_KEY }}
+          ELICIT_API_KEY: ${{ secrets.ELICIT_API_KEY }}
+          SCITE_API_KEY: ${{ secrets.SCITE_API_KEY }}
+          SCHOLARCY_API_KEY: ${{ secrets.SCHOLARCY_API_KEY }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          CORE_API_KEY: ${{ secrets.CORE_API_KEY }}
+          OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
+          OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
+          NCBI_EMAIL: ${{ secrets.NCBI_EMAIL }}
+          NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
+
+          # Google Docs (empty values fall back to the defaults in config/settings.py)
+          GOOGLE_SERVICE_ACCOUNT_FILE: config/google_service_account.json
+          LITREVIEW_GOOGLE_DOC_ID: ${{ secrets.LITREVIEW_GOOGLE_DOC_ID }}
+          PROPOSAL_GOOGLE_DOC_ID: ${{ secrets.PROPOSAL_GOOGLE_DOC_ID }}
+          AI_FAILURES_GOOGLE_DOC_ID: ${{ secrets.AI_FAILURES_GOOGLE_DOC_ID }}
+
+          # Email
+          EMAIL_BACKEND: ${{ vars.EMAIL_BACKEND || 'smtp' }}
+          SMTP_HOST: ${{ vars.SMTP_HOST || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ vars.SMTP_PORT || '587' }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_CC: ${{ secrets.EMAIL_CC }}
+
+          # Pipeline tuning
+          MAX_PAPERS_PER_RUN: ${{ vars.MAX_PAPERS_PER_RUN || '50' }}
+          MIN_RELEVANCE_SCORE: ${{ vars.MIN_RELEVANCE_SCORE || '6.0' }}
+          LLM_CONCURRENCY: ${{ vars.LLM_CONCURRENCY || '4' }}
+
+          # Paths
+          SQLITE_DB_PATH: storage/pipeline_state.db
+          PAPERS_DB_PATH: storage/papers_db.json
+          OUTPUTS_DIR: outputs
+        run: |
+          python main.py run --log-level "$LOG_LEVEL" --days-lookback "$DAYS_LOOKBACK"
+
+      # ── 6. Persist results (also after a partly failed run, so finished
+      #       papers are not re-analyzed next week). Commits are authored by
+      #       the repository owner so the contributors list stays unchanged.
+      - name: Commit updated documents and paper database
+        if: ${{ always() && env.DRY_RUN != 'true' && steps.pipeline.outcome != 'skipped' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          OWNER_ID: ${{ github.repository_owner_id }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "$OWNER"
+          git config user.email "${OWNER_ID}+${OWNER}@users.noreply.github.com"
+          # Everything under outputs/ except the HTML reports (ignored; they go to the artifact)
+          git add outputs
+          if [ -f storage/papers_db.json ]; then git add storage/papers_db.json; fi
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: weekly literature review update $(date -u +%Y-%m-%d)"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash origin "$BRANCH" && git push origin "HEAD:$BRANCH"; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying"
+            sleep $((attempt * 10))
+          done
+          echo "::error::Could not push the results commit"
+          exit 1
+
+      # ── 7. Upload logs and the HTML report ─────────────────────────────
+      - name: Upload pipeline logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pipeline-logs-${{ github.run_number }}
+          path: |
+            logs/
+            outputs/daily_reports/*.html
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Remove credentials
+        if: always()
+        run: rm -f config/google_service_account.json
+
+      # ── 8. Open (or update) an issue when the run fails ────────────────
+      - name: Report failure
+        if: ${{ (failure() || cancelled()) && github.event_name == 'schedule' }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const label = 'pipeline-failure';
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', labels: label,
+            });
+            const body = `The weekly literature review run #${context.runNumber} failed.\n\nLogs: ${runUrl}`;
+            if (open.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: open.data[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: `Weekly literature review failed (${new Date().toISOString().slice(0, 10)})`,
+                body, labels: [label],
+              });
+            }
