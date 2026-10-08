@@ -1,12 +1,12 @@
 # PhD LitReview Automator
 
-A production-grade, daily-running multi-agent pipeline that automates and maintains
+A production-grade, scheduled multi-agent pipeline that automates and maintains
 a PhD-level literature review process for research on **"The Integration Paradox:
 Why Reliable AI/ML Components Compose into Unreliable Systems?"**
 
 **Framework:** LangGraph (selected after rigorous 2026-era benchmarking — see [BENCHMARKING.md](BENCHMARKING.md))
-**LLM:** Claude claude-sonnet-4-6 (Anthropic)
-**Runs:** Daily at 6:00 AM UTC via GitHub Actions
+**LLM:** Anthropic Claude — `claude-opus-5-5` by default, configurable, with automatic fallback to a second model
+**Runs:** Weekly (Mondays 06:17 UTC) via GitHub Actions, or on demand
 
 ---
 
@@ -47,7 +47,7 @@ Why Reliable AI/ML Components Compose into Unreliable Systems?"**
 │  [visualization]  Citation network + gap matrix      │               │
 │    │                                                  │               │
 │    ▼                ◄────────────────────────────────┘               │
-│  [email_reporter]  Daily HTML summary + archive                      │
+│  [email_reporter]  HTML summary of each run + archive                │
 │    │                                                                  │
 │  END                                                                  │
 │                                                                      │
@@ -62,13 +62,13 @@ Why Reliable AI/ML Components Compose into Unreliable Systems?"**
 
 | Agent | Role | Primary Tools |
 |-------|------|---------------|
-| **1. Discovery** | Daily search across 5+ academic databases | Semantic Scholar, ArXiv, CrossRef, OpenAlex, Elicit, Perplexity |
-| **2. Extraction** | PDF extraction + structured summarization | Scholarcy, PyPDF, PyMuPDF, Claude claude-sonnet-4-6 |
-| **3. Critical Analysis** | Wagner blank-spot framework + inclusion/exclusion | Scite, Claude claude-sonnet-4-6 |
-| **4. Synthesis** | Cross-paper synthesis + gap identification | Claude claude-sonnet-4-6, PaperDB |
+| **1. Discovery** | Search across 5+ academic databases each run | Semantic Scholar, ArXiv, CrossRef, OpenAlex, Elicit, Perplexity |
+| **2. Extraction** | PDF extraction + structured summarization | Scholarcy, PyPDF, PyMuPDF, Claude |
+| **3. Critical Analysis** | Wagner blank-spot framework + inclusion/exclusion | Scite, Claude |
+| **4. Synthesis** | Cross-paper synthesis + gap identification | Claude, PaperDB |
 | **5. Document Update** | Incremental lit review + proposal updates | Google Docs API, Markdown, LaTeX |
 | **6. Visualization** | Citation networks + gap matrix + timeline | D3.js-ready JSON, Mermaid, Gephi |
-| **7. Email Reporter** | Daily executive summary + archive | Gmail SMTP, SendGrid, Jinja2 HTML |
+| **7. Email Reporter** | Executive summary of each run + archive | Gmail SMTP, SendGrid, Jinja2 HTML |
 
 ---
 
@@ -110,7 +110,7 @@ Every paper is analyzed through Jon Wagner's **blank-spot** method:
 
 ### 1. Prerequisites
 
-- Python 3.11+
+- Python 3.10+
 - Git
 - Anthropic API key (required)
 
@@ -144,7 +144,9 @@ ANTHROPIC_API_KEY=sk-ant-...
 EMAIL_TO=your.email@university.edu
 SMTP_USER=your.email@gmail.com
 SMTP_PASSWORD=your_gmail_app_password
+OPENALEX_API_KEY=...      # free; keyless OpenAlex requests fail on shared IPs
 ```
+Leave every other optional key blank rather than keeping a placeholder.
 
 ### 4. Initialize
 
@@ -159,7 +161,7 @@ python main.py status
 ### 5. First Run
 
 ```bash
-# Dry run (no email, no document writes — test everything works)
+# Dry run (no email, no document or database writes — test everything works)
 python main.py run --dry-run
 
 # Full run
@@ -167,42 +169,89 @@ python main.py run
 
 # Full run with human review checkpoint (pauses before writing to documents)
 python main.py run --human-checkpoint
+# ...review, then continue with the thread ID it prints:
+python main.py resume --thread-id run-YYYYMMDD-HHMMSS-xxxxxxxx
 ```
 
 ---
 
 ## Deployment (GitHub Actions — Recommended)
 
-The pipeline runs automatically via GitHub Actions every day at 6:00 AM UTC.
+`.github/workflows/weekly_litreview.yml` runs the pipeline **every Monday at 06:17 UTC**
+on the default branch. Each run commits the updated documents, bibliography,
+visualizations and `storage/papers_db.json` back to the repository (authored as the
+repository owner), so the next run skips papers it has already analyzed. Every run
+looks back 21 days; overlapping windows catch papers that sources index late, and
+known papers are skipped before any LLM call.
 
-### Setup GitHub Secrets
+### 1. Add the secrets (one time)
 
-In your repository: **Settings → Secrets and variables → Actions → New repository secret**
+With the [GitHub CLI](https://cli.github.com) signed in (`gh auth login`), copy your
+local `.env` into the repository's Actions secrets and variables:
+
+```bash
+scripts/setup_github_secrets.sh            # or: scripts/setup_github_secrets.sh owner/repo
+```
+
+It also uploads `config/google_service_account.json` (if present) as
+`GOOGLE_SERVICE_ACCOUNT_JSON`. To do it by hand instead: **Settings → Secrets and
+variables → Actions**.
 
 | Secret | Required | Description |
 |--------|----------|-------------|
 | `ANTHROPIC_API_KEY` | ✅ | Anthropic Claude API key |
 | `EMAIL_TO` | ✅ | Recipient email address |
-| `SMTP_USER` | ✅ | Gmail address |
-| `SMTP_PASSWORD` | ✅ | Gmail App Password |
+| `SMTP_USER` / `SMTP_PASSWORD` | ✅ (SMTP) | Gmail address and App Password |
+| `OPENALEX_API_KEY` | Recommended | Free key; keyless requests fail on GitHub's shared IPs |
 | `SEMANTIC_SCHOLAR_API_KEY` | Recommended | Higher rate limits |
-| `LANGSMITH_API_KEY` | Recommended | Pipeline observability |
-| `ELICIT_API_KEY` | Optional | Enhanced extraction |
-| `SCITE_API_KEY` | Optional | Citation quality signals |
-| `SCHOLARCY_API_KEY` | Optional | PDF extraction |
-| `PERPLEXITY_API_KEY` | Optional | Deep research queries |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Optional | Google Docs sync |
-| `LITREVIEW_GOOGLE_DOC_ID` | Optional | Your lit review doc ID |
-| `PROPOSAL_GOOGLE_DOC_ID` | Optional | Your proposal doc ID |
+| `EMAIL_FROM`, `EMAIL_CC` | Optional | Sender display name/address, CC list |
+| `SENDGRID_API_KEY` | Optional | When the `EMAIL_BACKEND` variable is `sendgrid` |
+| `LANGSMITH_API_KEY` | Optional | Tracing (enabled automatically when set) |
+| `ELICIT_API_KEY`, `SCITE_API_KEY`, `SCHOLARCY_API_KEY`, `PERPLEXITY_API_KEY` | Optional | Extra signals |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Optional | Google Docs sync (contents of the key file) |
+| `LITREVIEW_GOOGLE_DOC_ID`, `PROPOSAL_GOOGLE_DOC_ID` | Optional | Override the document IDs |
 
-### Manual Trigger
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ANTHROPIC_MODEL` | `claude-opus-5-5` | Primary model |
+| `ANTHROPIC_FALLBACK_MODEL` | `claude-sonnet-4-6` | Used on errors/refusals of the primary |
+| `ANTHROPIC_EFFORT` | per agent | Override reasoning effort for all agents |
+| `DAYS_LOOKBACK` | `21` | Search window in days |
+| `MAX_PAPERS_PER_RUN`, `MIN_RELEVANCE_SCORE` | `50`, `6.0` | Volume and inclusion threshold |
+| `LLM_CONCURRENCY` | `4` | Papers extracted/analyzed in parallel |
+| `EMAIL_BACKEND`, `SMTP_HOST`, `SMTP_PORT` | `smtp`, Gmail, `587` | Mail transport |
 
-Go to **Actions → PhD LitReview Daily Pipeline → Run workflow** to trigger manually.
+### 2. Test it
+
+**Actions → Weekly Literature Review → Run workflow**, tick *Dry run* (or
+`gh workflow run weekly_litreview.yml -f dry_run=true`). A dry run sends no email and
+commits nothing; its log and HTML report are attached to the run as an artifact.
+
+If a scheduled run fails or times out — including when the report email cannot be
+sent — the workflow opens (or comments on) an issue labelled `pipeline-failure`.
+Results of a partly failed run are still committed, and papers whose analysis or
+document update failed are retried automatically the next week.
+
+A run takes roughly 15–90 minutes depending on how many new papers it finds
+(papers are processed `LLM_CONCURRENCY`=4 at a time; the job limit is 5.5 hours).
+
+### Running locally as well
+
+GitHub Actions is the single place that should write the corpus. Locally, use
+`python main.py run --dry-run` — it never changes `storage/papers_db.json` or the
+documents. If you do a full local run (or load seed papers), commit and push
+`storage/papers_db.json` and `outputs/` afterwards, and `git pull` before the next
+local run so you have the papers the weekly job added.
+
+> **Privacy:** in a public repository the committed literature review, proposal and
+> paper database are public, as are the Actions logs and artifacts. Make the
+> repository private (Settings → General → Danger Zone) if that is not intended — a
+> private repository has 2,000 free Actions minutes per month, enough for weekly runs.
 
 ### Running Locally on a Schedule
 
 ```bash
-# Start local scheduler (runs daily at 6 AM UTC)
+# Uses CRON_SCHEDULE and TIMEZONE from .env (default: Mondays 06:17 UTC)
 python main.py schedule
 ```
 
@@ -220,12 +269,13 @@ outputs/
 │   ├── concept_map.mmd           # Mermaid concept map
 │   ├── gap_matrix.md             # Gap coverage table
 │   └── timeline.mmd              # Research timeline
+├── literature_review_updates.tex  # LaTeX versions of each update (for Overleaf)
 └── daily_reports/
-    └── YYYY-MM-DD_daily_report.html  # Archived email reports
+    └── YYYY-MM-DD_daily_report.html  # Archived email reports (Actions artifact, not committed)
 
 storage/
-├── papers_db.json                # All discovered papers (TinyDB)
-└── pipeline_state.db             # LangGraph checkpoints (SQLite)
+├── papers_db.json                # Analyzed papers, corpus, run log (tracked in git; updated by the workflow)
+└── pipeline_state.db             # LangGraph checkpoints (SQLite, local only)
 ```
 
 ---
@@ -243,48 +293,40 @@ The pipeline can sync updates directly to your existing Google Docs:
 
 Option A — Service Account (for GitHub Actions):
 1. Create a Google Cloud project → Enable Docs and Drive APIs
-2. Create a Service Account → Download JSON key
-3. Share your Google Docs with the service account email
-4. Set `GOOGLE_SERVICE_ACCOUNT_JSON` as a GitHub secret
+2. Create a Service Account → Download JSON key → save as `config/google_service_account.json`
+3. Share your Google Docs with the service account email (Editor)
+4. Run `scripts/setup_github_secrets.sh` (uploads it as `GOOGLE_SERVICE_ACCOUNT_JSON`)
 
 Option B — OAuth2 (for local runs):
 1. Create OAuth2 credentials in Google Cloud Console
 2. Download `credentials.json` → save to `config/google_credentials.json`
-3. Run `python scripts/initialize.py` → browser auth flow on first use
+3. Run `python main.py google-auth` → browser sign-in, token saved to `config/google_token.json`
+
+The documents must be native Google Docs: an uploaded `.docx` has to be converted
+first (File → Save as Google Docs), and its new ID used. `python scripts/initialize.py`
+checks that each document can be opened. Updates are appended with an
+`[Auto-updated DATE — SECTION]` marker and never appended twice.
 
 ---
 
 ## Cost Estimation
 
-| Component | Cost/Day (est.) | Notes |
-|-----------|----------------|-------|
-| Claude claude-sonnet-4-6 | ~$0.40–1.20 | 7 agent invocations × 50 papers max; estimate based on current pricing |
-| Semantic Scholar | Free | Free tier (100 req/5min) |
-| ArXiv | Free | Free |
-| OpenAlex | Free | Free |
-| CrossRef | Free | Free (polite pool) |
-| Elicit | $0–15/mo | Depends on tier |
-| Scite | $0–20/mo | Depends on tier |
-| GitHub Actions | Free | 2000 min/month free |
-| LangSmith | Free | Developer tier (5000 traces/mo) |
+Rough estimates per weekly run with up to 50 analyzed papers (Claude API list prices,
+Oct 2026). Most discovered papers are filtered out by a cheap pre-screen first.
 
-**Total estimated daily cost: $0.40–$1.20 (LLM only)**
-**Monthly: ~$12–36**
+| Component | Cost per run (est.) | Notes |
+|-----------|--------------------|-------|
+| `claude-opus-5-5` ($4 / $20 per MTok) | ~$4–12 | extraction + critical analysis per paper, one synthesis, batched document updates |
+| `claude-sonnet-5-5` ($2 / $10 per MTok) | ~$2–6 | set the `ANTHROPIC_MODEL` variable |
+| Semantic Scholar, arXiv, OpenAlex, CrossRef | Free | API keys are free |
+| GitHub Actions | Free (public) / within the free private quota | ~15–90 min per run |
 
 ### Cost Optimization Tips
 
-1. **Reduce `MAX_PAPERS_PER_RUN`** from 50 to 20 on quieter days (fewer LLM calls)
-2. **Cache Semantic Scholar results** — don't re-fetch same papers
-3. **Use Claude Haiku** for extraction (cheaper), Sonnet only for analysis/synthesis
-4. **Batch LLM calls** — the extraction agent already batches 10 papers per call
-5. **Skip extraction for low-relevance papers** — only extract papers with preliminary score ≥ 6.0
-
-```env
-# In .env for cost-optimized mode:
-MAX_PAPERS_PER_RUN=20
-MIN_RELEVANCE_SCORE=7.0
-DAYS_LOOKBACK=3
-```
+1. Lower `MAX_PAPERS_PER_RUN` or raise `MIN_RELEVANCE_SCORE`
+2. Use a cheaper model via the `ANTHROPIC_MODEL` variable
+3. Lower `ANTHROPIC_EFFORT` (e.g. `medium`) — each agent otherwise uses its own level
+   (low for screening, medium for extraction, high for analysis and writing)
 
 ---
 
@@ -337,12 +379,16 @@ python main.py status
 python main.py run                        # Full pipeline run
 python main.py run --dry-run              # Dry run (test mode)
 python main.py run --human-checkpoint     # Pause before doc updates
+python main.py resume --thread-id ID      # Continue a paused run
+python main.py run --days-lookback 30     # Override the search window
 python main.py run --log-level DEBUG      # Verbose output
-python main.py schedule                   # Start daily scheduler
+python main.py schedule                   # Local scheduler (CRON_SCHEDULE)
 python main.py status                     # Show pipeline stats
 python main.py export-bibtex              # Export corpus BibTeX
 python main.py export-bibtex --output my.bib  # Custom output path
 python main.py test-email                 # Verify email configuration
+python main.py google-auth                # One-time Google OAuth sign-in
+python -m pytest                          # Run the test suite
 ```
 
 ---
@@ -363,7 +409,10 @@ TRACKED_AUTHORS = [
 
 ## Seeding with Existing Papers
 
-Create a `seed_papers.json` file with paper metadata and run:
+Create a `seed_papers.json` file with papers you already know about and run the
+command below. Papers with `"inclusion_decision": true` join the corpus (marked as
+already documented, so they are not written into your documents again); the others
+are recorded as excluded. The pipeline never re-analyzes seeded papers.
 
 ```bash
 python scripts/initialize.py --seed-papers seed_papers.json
@@ -401,7 +450,8 @@ PhD-LitReview-Automator/
 │   ├── synthesis_agent.py      # Cross-paper synthesis
 │   ├── document_update_agent.py    # Living document maintenance
 │   ├── visualization_agent.py  # Citation networks + maps
-│   └── email_reporter_agent.py # Daily report generation
+│   ├── email_reporter_agent.py # Run report generation
+│   └── llm_utils.py            # Shared Claude client: model fallback, response parsing
 ├── config/
 │   ├── settings.py             # Pydantic settings from .env
 │   └── prompts.py              # All agent system prompts
@@ -419,14 +469,17 @@ PhD-LitReview-Automator/
 │   ├── scholarcy_tool.py       # PDF extraction
 │   ├── perplexity_tool.py      # Deep research queries
 │   ├── google_docs.py          # Google Docs sync
-│   ├── email_tool.py           # Email dispatch
-│   └── paper_db.py             # Local paper database
+│   ├── email_tool.py           # Email dispatch (SMTP / SendGrid)
+│   ├── bibtex.py               # Deterministic BibTeX from paper metadata
+│   └── paper_db.py             # Local paper database + cross-source de-duplication
 ├── scripts/
-│   └── initialize.py           # Setup & verification
+│   ├── initialize.py           # Setup & verification
+│   └── setup_github_secrets.sh # Copy .env into GitHub Actions secrets
 ├── .github/workflows/
-│   └── daily_run.yml           # GitHub Actions (daily 6AM UTC)
+│   └── weekly_litreview.yml    # GitHub Actions (Mondays 06:17 UTC)
+├── tests/                      # pytest suite (unit + end-to-end with a fake LLM)
 ├── outputs/                    # Generated documents
-├── storage/                    # Database files (gitignored)
+├── storage/                    # papers_db.json (tracked; updated by the workflow)
 ├── main.py                     # CLI entry point
 ├── requirements.txt
 ├── .env.example
@@ -441,4 +494,4 @@ MIT License. Research use permitted with attribution.
 
 ---
 
-*Built with LangGraph + Claude claude-sonnet-4-6 by the PhD LitReview Automator.*
+*Built with LangGraph and the Anthropic Claude API.*
