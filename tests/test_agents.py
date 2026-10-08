@@ -126,8 +126,9 @@ class TestSettings:
     """Test configuration loading."""
 
     def test_settings_load(self):
-        from config.settings import settings
-        assert settings.anthropic_model == "claude-sonnet-4-6"
+        from config.settings import Settings, settings
+        # Check the declared default; a local .env may override the live value
+        assert Settings.model_fields["anthropic_model"].default == "claude-opus-5-5"
         assert settings.max_papers_per_run > 0
         assert settings.min_relevance_score > 0
 
