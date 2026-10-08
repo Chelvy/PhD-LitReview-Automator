@@ -18,6 +18,24 @@ from config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
+_NOT_A_GOOGLE_DOC_HINT = (
+    "This ID points to an uploaded Office file (.docx), which the Docs API cannot edit. "
+    "Open it in Google Drive, use File → Save as Google Docs, share the new document with "
+    "the service account as Editor, and set LITREVIEW_GOOGLE_DOC_ID / PROPOSAL_GOOGLE_DOC_ID "
+    "to the new document's ID."
+)
+
+
+def _log_docs_error(event: str, doc_id: str, error: Exception) -> None:
+    message = str(error)
+    if "not supported for this document" in message:
+        logger.error(event, doc_id=doc_id, error=message[:200], hint=_NOT_A_GOOGLE_DOC_HINT)
+    elif "403" in message or "permission" in message.lower():
+        logger.error(event, doc_id=doc_id, error=message[:200],
+                     hint="Share the document with the service account's e-mail address as Editor.")
+    else:
+        logger.error(event, doc_id=doc_id, error=message[:200])
+
 
 def _get_docs_service():
     """Build Google Docs API service with service account or OAuth2."""
@@ -132,7 +150,7 @@ class GoogleDocsTool:
         try:
             return self.service.documents().get(documentId=doc_id).execute()
         except Exception as e:
-            logger.error("google_docs_get_failed", doc_id=doc_id, error=str(e))
+            _log_docs_error("google_docs_get_failed", doc_id, e)
             return None
 
     def get_document_text(self, doc_id: str) -> str:
@@ -207,7 +225,7 @@ class GoogleDocsTool:
             return True
 
         except Exception as e:
-            logger.error("google_docs_append_failed", doc_id=doc_id, error=str(e))
+            _log_docs_error("google_docs_append_failed", doc_id, e)
             return False
 
     def insert_at_section(

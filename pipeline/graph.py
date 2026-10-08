@@ -44,7 +44,8 @@ except ImportError:
 
 from config.settings import settings
 from state.pipeline_state import PipelineState
-from tools.paper_db import PaperDatabase
+from tools.paper_db import PaperDatabase, dedup_keys
+from agents.llm_utils import reset_failure_counts
 
 # Import agent node functions
 from agents.discovery_agent import run_discovery
@@ -68,6 +69,7 @@ def generate_run_metadata(state: PipelineState) -> dict[str, Any]:
     # Load known paper IDs from database to avoid reprocessing
     db = PaperDatabase()
     known_ids = list(db.get_known_ids())
+    known_keys = sorted(db.get_known_keys())
     stats = db.get_stats()
 
     logger.info(
@@ -83,8 +85,10 @@ def generate_run_metadata(state: PipelineState) -> dict[str, Any]:
         "run_id": run_id,
         "days_lookback": settings.days_lookback,
         "known_paper_ids": known_ids,
+        "known_paper_keys": known_keys,
         "errors": [],
         "warnings": [],
+        "synthesis_failed": False,
         "human_review_needed": False,
         "human_review_reasons": [],
     }
@@ -112,11 +116,14 @@ def discovery_node(state: PipelineState) -> dict[str, Any]:
 
 def deduplicate_node(state: PipelineState) -> dict[str, Any]:
     """
-    Deduplicate discovered papers against known corpus.
-    Also applies final title-based deduplication within the batch.
+    Remove papers already analyzed in earlier runs, and the same paper surfaced by
+    several sources in this run. Papers are matched on ID, DOI (case-insensitive),
+    arXiv ID and normalized title, since each source assigns its own paper_id.
     """
     discovered = state.get("discovered_papers", [])
-    known_ids = set(state.get("known_paper_ids", []))
+    known_keys = set(state.get("known_paper_keys", [])) | {
+        f"id:{pid}" for pid in state.get("known_paper_ids", [])
+    }
 
     if not discovered:
         return {"new_papers": [], "duplicate_count": 0}
@@ -126,28 +133,11 @@ def deduplicate_node(state: PipelineState) -> dict[str, Any]:
     duplicate_count = 0
 
     for paper in discovered:
-        paper_id = paper.get("paper_id", "")
-
-        # Skip if already in corpus
-        if paper_id in known_ids:
+        keys = dedup_keys(paper)
+        if not keys or keys & known_keys or keys & seen_in_batch:
             duplicate_count += 1
             continue
-
-        # Skip duplicates within this batch (same paper from different sources)
-        if paper_id in seen_in_batch:
-            duplicate_count += 1
-            continue
-
-        # DOI-based dedup (different IDs, same DOI)
-        doi = paper.get("doi", "")
-        if doi:
-            doi_key = f"doi:{doi}"
-            if doi_key in seen_in_batch or doi_key in known_ids:
-                duplicate_count += 1
-                continue
-            seen_in_batch.add(doi_key)
-
-        seen_in_batch.add(paper_id)
+        seen_in_batch |= keys
         new_papers.append(paper)
 
     logger.info(
@@ -215,6 +205,7 @@ def synthesis_node(state: PipelineState) -> dict[str, Any]:
     except Exception as e:
         logger.error("node_error", node="synthesis", error=str(e))
         return {
+            "synthesis_failed": True,  # skip document updates; papers are retried next run
             "synthesis_report": {
                 "synthesis_date": state.get("run_date", ""),
                 "papers_synthesized": [],
@@ -280,14 +271,29 @@ def email_reporter_node(state: PipelineState) -> dict[str, Any]:
 
 # ── Conditional routing ─────────────────────────────────────────────────────
 
+def _has_pending_documentation() -> bool:
+    """Corpus papers from earlier runs whose document update failed and must be retried."""
+    if settings.dry_run:
+        return False
+    try:
+        db = PaperDatabase()
+        return bool(db.get_undocumented_corpus() or db.get_undocumented_corpus("proposal_documented"))
+    except Exception as e:
+        logger.warning("pending_documentation_check_failed", error=str(e))
+        return False
+
+
 def route_after_deduplication(
     state: PipelineState,
-) -> Literal["extraction", "email_reporter"]:
-    """After dedup: if new papers exist, extract them; else skip to email."""
+) -> Literal["extraction", "synthesis", "email_reporter"]:
+    """After dedup: extract new papers; else retry pending document updates; else email."""
     new_papers = state.get("new_papers", [])
     if new_papers:
         logger.info("routing", decision="extraction", new_papers=len(new_papers))
         return "extraction"
+    if _has_pending_documentation():
+        logger.info("routing", decision="synthesis", reason="pending_document_updates")
+        return "synthesis"
     logger.info("routing", decision="email_reporter", reason="no_new_papers")
     return "email_reporter"
 
@@ -295,10 +301,13 @@ def route_after_deduplication(
 def route_after_analysis(
     state: PipelineState,
 ) -> Literal["synthesis", "email_reporter"]:
-    """After critical analysis: if papers were included, synthesize; else email."""
+    """After critical analysis: synthesize if papers were included or documents are pending."""
     included = state.get("included_papers", [])
     if included:
         logger.info("routing", decision="synthesis", included_papers=len(included))
+        return "synthesis"
+    if _has_pending_documentation():
+        logger.info("routing", decision="synthesis", reason="pending_document_updates")
         return "synthesis"
     logger.info("routing", decision="email_reporter", reason="no_included_papers")
     return "email_reporter"
@@ -307,18 +316,15 @@ def route_after_analysis(
 def route_after_synthesis(
     state: PipelineState,
 ) -> Literal["document_update", "email_reporter"]:
-    """After synthesis: update docs unless dry_run or error."""
+    """After synthesis: update docs unless dry_run or the synthesis failed."""
     if settings.dry_run:
         logger.info("routing", decision="email_reporter", reason="dry_run")
         return "email_reporter"
+    if state.get("synthesis_failed"):
+        # Papers stay undocumented in the corpus and are retried next run
+        logger.info("routing", decision="email_reporter", reason="synthesis_failed")
+        return "email_reporter"
     return "document_update"
-
-
-# ── Human-in-the-loop interrupt check ──────────────────────────────────────
-
-def should_interrupt_for_human(state: PipelineState) -> bool:
-    """Determine if we should pause for human review."""
-    return settings.human_review_checkpoint and bool(state.get("included_papers"))
 
 
 # ── Graph construction ───────────────────────────────────────────────────────
@@ -361,6 +367,7 @@ def build_pipeline(
         route_after_deduplication,
         {
             "extraction": "extraction",
+            "synthesis": "synthesis",
             "email_reporter": "email_reporter",
         },
     )
@@ -397,19 +404,27 @@ def build_pipeline(
     import os, sqlite3
     os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
 
-    # SqliteSaver requires a direct sqlite3 connection (not from_conn_string context manager)
+    # SqliteSaver requires a direct sqlite3 connection (not from_conn_string context manager).
+    # Dry runs keep checkpoints in memory so they write nothing under storage/.
     try:
-        _conn = sqlite3.connect(db_path, check_same_thread=False)
-        checkpointer = SqliteSaver(_conn)
+        if settings.dry_run:
+            checkpointer = InMemorySaver()
+        else:
+            _conn = sqlite3.connect(db_path, check_same_thread=False)
+            checkpointer = SqliteSaver(_conn)
     except Exception:
         # Fallback to in-memory saver for environments where SQLite write fails
         logger.warning("sqlite_checkpointer_fallback", reason="Using InMemorySaver")
         checkpointer = InMemorySaver()
 
-    # Interrupt before document updates for human review (optional)
+    # Interrupt before document updates for human review (optional). Never in
+    # GitHub Actions: nobody is there to resume the run, so it would just stop.
     interrupt_nodes = ["document_update"] if (
         interrupt_before_docs or settings.human_review_checkpoint
     ) else []
+    if interrupt_nodes and os.environ.get("GITHUB_ACTIONS") == "true":
+        logger.warning("human_checkpoint_ignored", reason="unattended GitHub Actions run")
+        interrupt_nodes = []
 
     app = graph.compile(
         checkpointer=checkpointer,
@@ -439,10 +454,15 @@ def run_pipeline(
         Final pipeline state.
     """
     app = build_pipeline(interrupt_before_docs=interrupt_before_docs)
+    reset_failure_counts()  # a long-running `schedule` process must not carry them across runs
 
+    # Each run gets its own checkpoint thread. Reusing a thread (e.g. one per date)
+    # makes LangGraph resume the previous run's state, and the operator.add reducers
+    # then accumulate its errors and paper lists into the new run.
+    thread_id = f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     run_config: RunnableConfig = {
         "configurable": {
-            "thread_id": f"daily-run-{datetime.now().strftime('%Y-%m-%d')}",
+            "thread_id": thread_id,
             **(config or {}),
         },
         "recursion_limit": 50,
@@ -454,13 +474,37 @@ def run_pipeline(
 
     try:
         final_state = app.invoke(initial_state, config=run_config)
+    except Exception as e:
+        logger.error("pipeline_run_failed", error=str(e))
+        raise
+    return _finish(app, run_config, final_state)
+
+
+def resume_pipeline(thread_id: str) -> dict[str, Any]:
+    """Resume a run paused at the human-review checkpoint (after reviewing it)."""
+    app = build_pipeline(interrupt_before_docs=False)
+    run_config: RunnableConfig = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+    snapshot = app.get_state(run_config)
+    if not snapshot.next:
+        raise ValueError(f"Run {thread_id!r} is not paused (unknown thread or already finished)")
+    logger.info("pipeline_resuming", thread_id=thread_id, next=list(snapshot.next))
+    final_state = app.invoke(None, config=run_config)
+    return _finish(app, run_config, final_state)
+
+
+def _finish(app: Any, run_config: RunnableConfig, final_state: dict[str, Any]) -> dict[str, Any]:
+    """Annotate the final state with the thread ID and, if paused, where the run stopped."""
+    thread_id = run_config["configurable"]["thread_id"]
+    final_state = {**final_state, "thread_id": thread_id}
+    paused_at = list(app.get_state(run_config).next)
+    if paused_at:
+        final_state["paused_at"] = paused_at
+        logger.info("pipeline_paused_for_review", thread_id=thread_id, next=paused_at)
+    else:
         logger.info(
             "pipeline_run_complete",
             included=len(final_state.get("included_papers", [])),
             email_sent=final_state.get("email_sent", False),
             errors=len(final_state.get("errors", [])),
         )
-        return final_state
-    except Exception as e:
-        logger.error("pipeline_run_failed", error=str(e))
-        raise
+    return final_state

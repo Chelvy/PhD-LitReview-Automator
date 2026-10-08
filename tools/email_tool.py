@@ -13,8 +13,9 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import structlog
-from jinja2 import Template
+from jinja2 import Environment
 
 from config.settings import settings
 
@@ -28,7 +29,7 @@ EMAIL_HTML_TEMPLATE = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PhD LitReview Daily Update</title>
+<title>PhD LitReview Update</title>
 <style>
   body { font-family: 'Segoe UI', Arial, sans-serif; background: #f7f7f7; margin: 0; padding: 20px; color: #222; }
   .container { max-width: 750px; margin: 0 auto; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
@@ -60,7 +61,7 @@ EMAIL_HTML_TEMPLATE = """
 <body>
 <div class="container">
   <div class="header">
-    <h1>📚 PhD LitReview Daily Update</h1>
+    <h1>📚 PhD LitReview Update</h1>
     <div class="subtitle">{{ topic_short }} · {{ run_date }}</div>
   </div>
 
@@ -85,7 +86,7 @@ EMAIL_HTML_TEMPLATE = """
       </div>
       {% endfor %}
     {% else %}
-      <div class="no-papers">No new papers met the inclusion criteria today.</div>
+      <div class="no-papers">No new papers met the inclusion criteria this run.</div>
     {% endif %}
   </div>
 
@@ -118,7 +119,7 @@ EMAIL_HTML_TEMPLATE = """
       </div>
       {% endfor %}
     {% else %}
-      <div class="no-papers">No document updates today (no new included papers).</div>
+      <div class="no-papers">No document updates this run.</div>
     {% endif %}
     {% if doc_links %}
     <div style="margin-top:12px; font-size:13px;">
@@ -127,6 +128,19 @@ EMAIL_HTML_TEMPLATE = """
     </div>
     {% endif %}
   </div>
+
+  <!-- Pipeline problems -->
+  {% if errors or warnings %}
+  <div class="section">
+    <div class="section-title">🛠️ Pipeline Problems This Run</div>
+    {% for err in errors %}
+    <div class="action-item"><strong>{{ err.node or 'pipeline' }}</strong>: {{ err.error }}</div>
+    {% endfor %}
+    {% for w in warnings %}
+    <div class="update-item">{{ w }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
 
   <!-- Human Action Required -->
   {% if human_action_items %}
@@ -145,7 +159,7 @@ EMAIL_HTML_TEMPLATE = """
   </div>
 
   <div class="footer">
-    PhD LitReview Automator · Powered by LangGraph + Claude claude-sonnet-4-6 · {{ run_date }}<br>
+    PhD LitReview Automator · LangGraph + {{ model_name }} · {{ run_date }}<br>
     <a href="{{ doc_links.lit_review if doc_links else '#' }}" style="color:#888;">Literature Review</a> ·
     <a href="{{ doc_links.proposal if doc_links else '#' }}" style="color:#888;">Research Proposal</a>
   </div>
@@ -155,8 +169,17 @@ EMAIL_HTML_TEMPLATE = """
 """
 
 
+_TEMPLATE_ENV = Environment(autoescape=True)
+
+SENDGRID_SEND_URL = "https://api.sendgrid.com/v3/mail/send"
+
+
+def _split_addresses(value: Optional[str]) -> list[str]:
+    return [a.strip() for a in (value or "").split(",") if a.strip()]
+
+
 class EmailTool:
-    """Send daily pipeline report emails via SMTP or SendGrid."""
+    """Send pipeline report emails via SMTP or SendGrid."""
 
     def __init__(self) -> None:
         self.enabled = settings.has_email
@@ -176,65 +199,83 @@ class EmailTool:
             logger.info("email_skipped_dry_run", subject=subject)
             return False
 
-        recipient = to or settings.email_to
-        if not recipient:
+        to_addrs = _split_addresses(to or settings.email_to)
+        cc_addrs = _split_addresses(cc if cc is not None else settings.email_cc)
+        if not to_addrs:
             logger.error("email_no_recipient")
             return False
+        sender = settings.email_from or settings.smtp_user
 
         try:
+            if settings.email_backend == "sendgrid":
+                return self._send_via_sendgrid(sender, subject, html_body, text_body, to_addrs, cc_addrs)
+
             msg = MIMEMultipart("alternative")
             msg["Subject"] = subject
-            msg["From"] = settings.email_from
-            msg["To"] = recipient
-            if cc or settings.email_cc:
-                msg["Cc"] = cc or settings.email_cc
-
+            msg["From"] = sender
+            msg["To"] = ", ".join(to_addrs)
+            if cc_addrs:
+                msg["Cc"] = ", ".join(cc_addrs)
             msg.attach(MIMEText(text_body, "plain", "utf-8"))
             msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-            if settings.email_backend == "sendgrid" and settings.sendgrid_api_key:
-                return self._send_via_sendgrid(subject, html_body, text_body, recipient)
-            else:
-                return self._send_via_smtp(msg, recipient)
+            return self._send_via_smtp(msg, to_addrs + cc_addrs)
 
         except Exception as e:
             logger.error("email_send_failed", error=str(e))
             return False
 
-    def _send_via_smtp(self, msg: MIMEMultipart, recipient: str) -> bool:
+    def _send_via_smtp(self, msg: MIMEMultipart, recipients: list[str]) -> bool:
         ctx = ssl.create_default_context()
         try:
-            with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
-                server.ehlo()
-                server.starttls(context=ctx)
+            if settings.smtp_port == 465:
+                server = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, context=ctx, timeout=60)
+            else:
+                server = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=60)
+            with server:
+                if settings.smtp_port != 465:
+                    server.ehlo()
+                    server.starttls(context=ctx)
                 server.login(settings.smtp_user, settings.smtp_password)
-                all_recipients = [r.strip() for r in recipient.split(",")]
-                if settings.email_cc:
-                    all_recipients += [r.strip() for r in settings.email_cc.split(",")]
-                server.sendmail(settings.smtp_user, all_recipients, msg.as_string())
-            logger.info("email_sent_smtp", to=recipient)
+                server.sendmail(settings.smtp_user, recipients, msg.as_string())
+            # Recipient addresses are not logged: logs of a public repo's runs are public.
+            logger.info("email_sent_smtp", recipients=len(recipients))
             return True
         except Exception as e:
             logger.error("smtp_send_failed", error=str(e))
             return False
 
     def _send_via_sendgrid(
-        self, subject: str, html: str, text: str, recipient: str
+        self, sender: str, subject: str, html: str, text: str, to_addrs: list[str], cc_addrs: list[str]
     ) -> bool:
-        try:
-            import sendgrid
-            from sendgrid.helpers.mail import Mail, Email, To, Content
+        """Send through the SendGrid v3 HTTP API (no SDK dependency)."""
+        from email.utils import parseaddr
 
-            sg = sendgrid.SendGridAPIClient(api_key=settings.sendgrid_api_key)
-            mail = Mail(
-                from_email=Email(settings.smtp_user),
-                to_emails=To(recipient),
-                subject=subject,
-                html_content=Content("text/html", html),
+        name, address = parseaddr(sender)
+        personalization: dict = {"to": [{"email": a} for a in to_addrs]}
+        if cc_addrs:
+            personalization["cc"] = [{"email": a} for a in cc_addrs]
+        payload = {
+            "personalizations": [personalization],
+            "from": {"email": address, **({"name": name} if name else {})},
+            "subject": subject,
+            "content": [
+                {"type": "text/plain", "value": text},
+                {"type": "text/html", "value": html},
+            ],
+        }
+        try:
+            resp = httpx.post(
+                SENDGRID_SEND_URL,
+                json=payload,
+                headers={"Authorization": f"Bearer {settings.sendgrid_api_key}"},
+                timeout=30.0,
             )
-            response = sg.send(mail)
-            logger.info("email_sent_sendgrid", status=response.status_code)
-            return response.status_code in (200, 202)
+            ok = resp.status_code in (200, 202)
+            if ok:
+                logger.info("email_sent_sendgrid", status=resp.status_code, recipients=len(to_addrs) + len(cc_addrs))
+            else:
+                logger.error("sendgrid_send_failed", status=resp.status_code, body=resp.text[:300])
+            return ok
         except Exception as e:
             logger.error("sendgrid_send_failed", error=str(e))
             return False
@@ -244,12 +285,13 @@ class EmailTool:
         Render the HTML and plain-text versions of the daily report.
         Returns: (html_body, text_body)
         """
-        template = Template(EMAIL_HTML_TEMPLATE)
+        context = {"model_name": settings.anthropic_model, "errors": [], "warnings": [], **context}
+        template = _TEMPLATE_ENV.from_string(EMAIL_HTML_TEMPLATE)
         html = template.render(**context)
 
         # Build simple plain-text fallback
         lines = [
-            f"PhD LitReview Daily Update — {context.get('run_date', '')}",
+            f"PhD LitReview Update — {context.get('run_date', '')}",
             "=" * 60,
             "",
             f"NEW PAPERS: {context.get('n_discovered', 0)} discovered, "
@@ -257,23 +299,29 @@ class EmailTool:
             "",
         ]
         for paper in context.get("included_papers", []):
-            lines.append(f"  • {paper.get('title', 'Unknown')}")
-            lines.append(f"    Relevance: {paper.get('relevance_score', 0):.1f}/10")
-            lines.append(f"    {paper.get('critical_notes', '')}")
+            lines.append(f"  • {paper.get('title') or 'Unknown'}")
+            lines.append(f"    Relevance: {float(paper.get('relevance_score') or 0):.1f}/10")
+            lines.append(f"    {paper.get('critical_notes') or ''}")
             lines.append("")
+
+        problems = [f"  ! {e.get('node', 'pipeline')}: {e.get('error', '')}" for e in context.get("errors", [])]
+        problems += [f"  - {w}" for w in context.get("warnings", [])]
+        if problems:
+            lines += ["PIPELINE PROBLEMS THIS RUN:", *problems, ""]
 
         lines += [
             "GAP ANALYSIS:",
             *[
                 f"  {gid}: {gdata.get('papers_addressing', 0)} papers — {gdata.get('trajectory', '')}"
                 for gid, gdata in context.get("gap_status", {}).items()
+                if isinstance(gdata, dict)
             ],
             "",
             "CONTRIBUTION REMINDER:",
             context.get("contribution_reminder", ""),
             "",
             "---",
-            "PhD LitReview Automator | LangGraph + Claude claude-sonnet-4-6",
+            f"PhD LitReview Automator | LangGraph + {context['model_name']}",
         ]
 
         return html, "\n".join(lines)

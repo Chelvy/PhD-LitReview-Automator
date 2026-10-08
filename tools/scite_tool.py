@@ -118,7 +118,16 @@ class SciteTool:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                 )
                 resp.raise_for_status()
-                return resp.json().get("tally", {})
+                data = resp.json()
+                # Counts are returned at the top level; the contrasting class is named
+                # "contradicting" by the API. Accept a nested "tally" object too.
+                tally = data.get("tally", data) if isinstance(data, dict) else {}
+                return {
+                    "supporting": tally.get("supporting", 0),
+                    "contrasting": tally.get("contrasting", tally.get("contradicting", 0)),
+                    "mentioning": tally.get("mentioning", 0),
+                    "total": tally.get("total", 0),
+                }
         except Exception:
             return {}
 

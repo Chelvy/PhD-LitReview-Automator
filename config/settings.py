@@ -16,11 +16,17 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # Treat empty env vars (e.g. unset GitHub secrets) as missing so defaults apply.
+        env_ignore_empty=True,
     )
 
     # ── LLM ──────────────────────────────────────────────────────────────
     anthropic_api_key: str = Field(default="", description="Anthropic API key")
-    anthropic_model: str = Field(default="claude-sonnet-4-6")
+    anthropic_model: str = Field(default="claude-opus-5-5")
+    # Used when the primary model errors (bad model ID, no access, outage) or refuses.
+    anthropic_fallback_model: str = Field(default="claude-sonnet-4-6")
+    # Optional global override of each agent's reasoning effort (low|medium|high|xhigh|max).
+    anthropic_effort: str = Field(default="")
     openai_api_key: str = Field(default="", description="OpenAI API key (fallback)")
 
     # ── LangSmith ─────────────────────────────────────────────────────────
@@ -36,6 +42,7 @@ class Settings(BaseSettings):
     perplexity_api_key: str = Field(default="")
     core_api_key: str = Field(default="")
     openalex_email: str = Field(default="")
+    openalex_api_key: str = Field(default="")
     ncbi_email: str = Field(default="")
     ncbi_api_key: str = Field(default="")
 
@@ -53,7 +60,7 @@ class Settings(BaseSettings):
     smtp_port: int = Field(default=587)
     smtp_user: str = Field(default="")
     smtp_password: str = Field(default="")
-    email_from: str = Field(default="PhD LitReview Bot <noreply@example.com>")
+    email_from: str = Field(default="")  # defaults to smtp_user when empty
     email_to: str = Field(default="")
     email_cc: str = Field(default="")
     sendgrid_api_key: str = Field(default="")
@@ -62,8 +69,11 @@ class Settings(BaseSettings):
     max_papers_per_run: int = Field(default=50)
     min_relevance_score: float = Field(default=6.0)
     relevance_citation_boost: float = Field(default=0.5)
-    days_lookback: int = Field(default=7)
+    # Weekly runs look back 3 weeks: sources index papers days or weeks late, and
+    # de-duplication makes the overlap cheap (known papers are skipped before any LLM call).
+    days_lookback: int = Field(default=21)
     human_review_checkpoint: bool = Field(default=False)
+    llm_concurrency: int = Field(default=4)  # papers extracted/analyzed in parallel
     max_retries: int = Field(default=3)
     retry_delay: float = Field(default=2.0)
 
@@ -73,7 +83,7 @@ class Settings(BaseSettings):
     outputs_dir: str = Field(default="outputs")
 
     # ── Scheduling ─────────────────────────────────────────────────────────
-    cron_schedule: str = Field(default="0 6 * * *")
+    cron_schedule: str = Field(default="17 6 * * 1")  # Mondays 06:17 (local `schedule` command)
     timezone: str = Field(default="UTC")
 
     # ── Debug ──────────────────────────────────────────────────────────────
@@ -153,7 +163,11 @@ class Settings(BaseSettings):
 
     @property
     def has_email(self) -> bool:
-        return bool(self.smtp_user and self.smtp_password and self.email_to)
+        if not self.email_to:
+            return False
+        if self.email_backend == "sendgrid":
+            return bool(self.sendgrid_api_key and (self.email_from or self.smtp_user))
+        return bool(self.smtp_user and self.smtp_password)
 
 
 settings = Settings()

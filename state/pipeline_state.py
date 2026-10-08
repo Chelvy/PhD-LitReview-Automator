@@ -148,6 +148,7 @@ class PipelineState(TypedDict, total=False):
     search_queries: list[str]
     discovered_papers: Annotated[list[Paper], operator.add]
     known_paper_ids: list[str]               # IDs already in our corpus
+    known_paper_keys: list[str]              # ID/DOI/arXiv/title keys of analyzed papers
 
     # ── Deduplication ─────────────────────────────────────────────────────
     new_papers: list[Paper]                  # After removing known IDs
@@ -161,9 +162,11 @@ class PipelineState(TypedDict, total=False):
     analyzed_papers: Annotated[list[Paper], operator.add]
     included_papers: list[Paper]
     excluded_papers: list[Paper]
+    analysis_errors: Annotated[list[dict[str, Any]], operator.add]  # retried next run
 
     # ── Synthesis ─────────────────────────────────────────────────────────
     synthesis_report: SynthesisReport
+    synthesis_failed: bool                   # skip document updates; papers retried next run
 
     # ── Document updates ──────────────────────────────────────────────────
     lit_review_updates: list[DocumentUpdate]

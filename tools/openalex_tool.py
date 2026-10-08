@@ -1,6 +1,8 @@
 """
 OpenAlex API integration — free, open, comprehensive scholarly graph.
-200M+ works, no API key needed for most use (polite pool with email).
+Requests without an API key share a small daily budget per IP address (GitHub
+Actions runners exhaust it quickly), so set OPENALEX_API_KEY — keys are free:
+https://help.openalex.org/api/authentication/
 Docs: https://docs.openalex.org/
 """
 from __future__ import annotations
@@ -11,14 +13,19 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 import structlog
 
 from config.settings import settings
+from tools.paper_db import strip_markup
 
 logger = structlog.get_logger(__name__)
 
 OPENALEX_BASE = "https://api.openalex.org"
+
+
+class OpenAlexBudgetExceeded(RuntimeError):
+    """Keyless daily budget used up — retrying the same day cannot succeed."""
 
 # OpenAlex concept IDs for our research fields
 RELEVANT_CONCEPT_IDS = {
@@ -39,9 +46,16 @@ class OpenAlexTool:
 
     def __init__(self) -> None:
         self.email = settings.openalex_email or "researcher@university.edu"
-        self.headers = {"User-Agent": f"mailto:{self.email}"}
+        self.headers = {"User-Agent": f"PhD-LitReview-Automator (mailto:{self.email})"}
+        if settings.openalex_api_key:
+            self.headers["Authorization"] = f"Bearer {settings.openalex_api_key}"
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=16))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=16),
+        retry=retry_if_not_exception_type(OpenAlexBudgetExceeded),
+        reraise=True,
+    )
     def search(
         self,
         query: str,
@@ -51,10 +65,14 @@ class OpenAlexTool:
     ) -> list[dict[str, Any]]:
         """Search OpenAlex works by query string with optional concept filtering."""
         from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        to_date = datetime.now().strftime("%Y-%m-%d")
 
         params: dict[str, Any] = {
             "search": query,
-            "filter": f"from_publication_date:{from_date},type:article|preprint|proceedings-article",
+            "filter": (
+                f"from_publication_date:{from_date},to_publication_date:{to_date},"
+                "type:article|preprint|proceedings-article"
+            ),
             "per-page": min(limit, 200),
             "select": (
                 "id,doi,title,authorships,publication_year,publication_date,"
@@ -62,7 +80,6 @@ class OpenAlexTool:
                 "abstract_inverted_index,related_works,referenced_works"
             ),
             "sort": "relevance_score:desc",
-            "mailto": self.email,
         }
 
         if concept_ids:
@@ -81,9 +98,19 @@ class OpenAlexTool:
                 results = data.get("results", [])
                 logger.info("openalex_search", query=query, found=len(results))
                 return [self._normalize(r, query) for r in results]
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429 and not settings.openalex_api_key:
+                logger.error(
+                    "openalex_rate_limited",
+                    query=query,
+                    hint="Set OPENALEX_API_KEY (free at https://openalex.org) — keyless requests share a per-IP daily budget",
+                )
+                raise OpenAlexBudgetExceeded("OpenAlex keyless budget exhausted — set OPENALEX_API_KEY") from e
+            logger.error("openalex_search_error", query=query, status=e.response.status_code)
+            raise
         except Exception as e:
             logger.error("openalex_search_error", query=query, error=str(e))
-            return []
+            raise
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=16))
     def get_work(self, openalex_id: str) -> Optional[dict[str, Any]]:
@@ -139,42 +166,42 @@ class OpenAlexTool:
 
     def _normalize(self, raw: dict[str, Any], query: str) -> dict[str, Any]:
         doi = (raw.get("doi") or "").replace("https://doi.org/", "")
-        openalex_id = raw.get("id", "").replace("https://openalex.org/", "")
+        openalex_id = (raw.get("id") or "").replace("https://openalex.org/", "")
 
         # Authors
         authorships = raw.get("authorships") or []
         authors = []
         for a in authorships:
             author = a.get("author") or {}
-            name = author.get("display_name", "")
+            name = author.get("display_name") or ""
             if name:
                 authors.append(name)
 
         # Location / URL
         primary_loc = raw.get("primary_location") or {}
         source = primary_loc.get("source") or {}
-        venue = source.get("display_name", "")
-        url = primary_loc.get("landing_page_url", "")
+        venue = source.get("display_name") or ""
+        url = primary_loc.get("landing_page_url") or ""
 
         best_oa = raw.get("best_oa_location") or {}
-        pdf_url = best_oa.get("pdf_url", "")
+        pdf_url = best_oa.get("pdf_url") or ""
 
         # Concepts
-        concepts = [c.get("display_name", "") for c in (raw.get("concepts") or [])]
+        concepts = [c.get("display_name") or "" for c in (raw.get("concepts") or [])]
 
         abstract = self._reconstruct_abstract(raw.get("abstract_inverted_index"))
 
         year = raw.get("publication_year")
-        pub_date = raw.get("publication_date", "")
+        pub_date = raw.get("publication_date") or ""
+        title = strip_markup(raw.get("title") or raw.get("display_name") or "")
 
         stable_id = f"doi:{doi}" if doi else f"openalex:{openalex_id}"
         if not doi and not openalex_id:
-            title = raw.get("title", "")
             stable_id = "hash:" + hashlib.md5(title.encode()).hexdigest()[:12]
 
         return {
             "paper_id": stable_id,
-            "title": raw.get("title", ""),
+            "title": title,
             "authors": authors,
             "year": year,
             "abstract": abstract,
@@ -183,7 +210,7 @@ class OpenAlexTool:
             "semantic_scholar_id": "",
             "openalex_id": openalex_id,
             "venue": venue,
-            "citation_count": raw.get("cited_by_count", 0),
+            "citation_count": raw.get("cited_by_count") or 0,
             "url": url,
             "pdf_url": pdf_url,
             "fields_of_study": concepts,

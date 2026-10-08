@@ -412,36 +412,22 @@ UPDATE PRINCIPLES:
 
 OUTPUT FORMAT (strict JSON):
 {{
-  "update_date": "YYYY-MM-DD",
-  "literature_review_updates": [
+  "document_updates": [
     {{
       "section_path": "2.3.1 Compositional Verification",
-      "action": "create_subsection | append_paragraph | update_paragraph | add_citation",
+      "action": "create_subsection | append_paragraph | update_paragraph",
+      "markdown_content": "### 2.3.1 Compositional Verification\\n\\n...",
       "latex_content": "\\\\subsection{{Compositional Verification}} ...",
-      "markdown_content": "### Compositional Verification\\n\\n...",
-      "citations_added": ["Author2025", "Smith2024"],
+      "citations_added": ["Smith2025Compositional"],
       "justification": "New paper by X fills GAP-2 with first formal treatment of ..."
     }}
   ],
-  "research_proposal_updates": [
-    {{
-      "section_path": "3.2 Methodology — Integration Stress Testing",
-      "action": "strengthen",
-      "latex_content": "...",
-      "markdown_content": "...",
-      "citations_added": ["Jones2025"],
-      "justification": "Paper X validates our planned integration stress-testing approach"
-    }}
-  ],
-  "new_citations": [
-    {{
-      "key": "Author2025",
-      "bibtex": "@article{{Author2025, author={{...}}, title={{...}}, ...}}",
-      "apa": "Author, F. (2025). Title. Journal, Vol(Issue), pages."
-    }}
-  ],
-  "version_notes": "Run YYYY-MM-DD: Added 3 papers to §2.3.1 (compositional verification), strengthened GAP-2 argument, updated contribution statement"
+  "version_notes": "Run YYYY-MM-DD: added 3 papers to §2.3.1 (compositional verification), strengthened GAP-2 argument"
 }}
+
+CITATIONS: every paper you are given comes with a citation key. Cite papers only by
+those keys — [@Key] in Markdown, \\citep{{Key}} in LaTeX — and never invent keys,
+authors, DOIs or bibliographic details. The bibliography is generated separately.
 
 LATEX STYLE GUIDE:
 - Use \\subsection, \\subsubsection for structure

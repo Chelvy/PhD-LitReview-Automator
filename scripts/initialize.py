@@ -2,7 +2,7 @@
 """
 PhD LitReview Automator — Initialization Script
 
-Run this ONCE before the first daily pipeline run to:
+Run this ONCE before the first pipeline run to:
 1. Verify all API credentials
 2. Initialize the local database
 3. Download and process any provided seed papers
@@ -85,20 +85,55 @@ def test_anthropic_api() -> bool:
         console.print("[red]Anthropic API key not configured![/red]")
         return False
 
+    from langchain_core.messages import HumanMessage
+    from agents.llm_utils import _make_chat_model, message_text
+
+    # Check the primary and the fallback model separately, so a model the API key
+    # cannot use is reported here instead of silently falling back every week.
+    ok = True
+    models = [settings.anthropic_model]
+    if settings.anthropic_fallback_model and settings.anthropic_fallback_model != settings.anthropic_model:
+        models.append(settings.anthropic_fallback_model)
+    for model in models:
+        try:
+            llm = _make_chat_model(model, temperature=None, max_tokens=1024, effort="low")
+            reply = message_text(llm.invoke([HumanMessage(content="Reply only with: READY")]))
+            if not reply:
+                raise RuntimeError("empty reply")
+            console.print(f"[green]✓ Anthropic API working with {model}: {reply[:40]}[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ Anthropic API failed with {model}: {e}[/red]")
+            ok = ok and model != settings.anthropic_model  # only the primary model is required
+    return ok
+
+
+def test_google_docs() -> None:
+    """Check that each configured Google Doc can actually be opened through the Docs API."""
+    from config.settings import settings
+    from tools.google_docs import _get_docs_service
+
+    if not settings.has_google_docs:
+        console.print("[yellow]⚠ Google Docs credentials not configured — skipping (sync disabled)[/yellow]")
+        return
     try:
-        from langchain_anthropic import ChatAnthropic
-        llm = ChatAnthropic(
-            model=settings.anthropic_model,
-            api_key=settings.anthropic_api_key,
-            max_tokens=50,
-        )
-        from langchain_core.messages import HumanMessage
-        response = llm.invoke([HumanMessage(content="Reply only with: READY")])
-        console.print(f"[green]✓ Anthropic API working: {response.content.strip()}[/green]")
-        return True
+        service = _get_docs_service()
     except Exception as e:
-        console.print(f"[red]✗ Anthropic API failed: {e}[/red]")
-        return False
+        console.print(f"[red]✗ Google Docs authentication failed: {e}[/red]")
+        return
+    for label, doc_id in (("Literature review", settings.litreview_google_doc_id),
+                          ("Research proposal", settings.proposal_google_doc_id)):
+        if not doc_id:
+            continue
+        try:
+            doc = service.documents().get(documentId=doc_id).execute()
+            console.print(f"[green]✓ {label}: '{doc.get('title', '')}' is accessible[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ {label} ({doc_id}): {e}[/red]")
+            console.print(
+                "[yellow]  If the file shows a .DOCX badge in Google Drive, open it and use File → Save as "
+                "Google Docs, then set the new document ID. Also share the document with the service "
+                "account's e-mail address as an Editor.[/yellow]"
+            )
 
 
 def test_semantic_scholar() -> bool:
@@ -268,15 +303,37 @@ into credible, update-resilient assurance?
 
 
 def load_seed_papers(seed_file: str) -> None:
-    """Load seed papers from a JSON file into the database."""
+    """
+    Load papers you already know about (e.g. ones in your existing literature review).
+    Papers with "inclusion_decision": true join the corpus — marked as already
+    documented, so they are not written into the documents again; the rest are
+    recorded as excluded. Either way the pipeline will not re-analyze them.
+    """
     try:
         with open(seed_file) as f:
             seed_papers = json.load(f)
 
         from tools.paper_db import PaperDatabase
         db = PaperDatabase()
-        added = db.save_papers_batch(seed_papers)
-        console.print(f"[green]✓ Loaded {len(seed_papers)} seed papers ({added} new)[/green]")
+        included = excluded = skipped = 0
+        for paper in seed_papers:
+            if not paper.get("paper_id"):
+                skipped += 1
+                continue
+            db.save_paper(paper)
+            if paper.get("inclusion_decision"):
+                db.add_to_corpus({**paper, "documented": True, "proposal_documented": True})
+                included += 1
+            else:
+                db.add_to_excluded(paper, paper.get("exclusion_reason") or "seed: excluded")
+                excluded += 1
+        console.print(
+            f"[green]✓ Loaded {included + excluded} seed papers "
+            f"({included} into the corpus, {excluded} excluded)[/green]\n"
+            "  Commit and push storage/papers_db.json so the weekly GitHub Actions run knows them."
+        )
+        if skipped:
+            console.print(f"[yellow]⚠ Skipped {skipped} seed papers without a paper_id[/yellow]")
     except Exception as e:
         console.print(f"[red]✗ Failed to load seed papers: {e}[/red]")
 
@@ -295,17 +352,17 @@ def test_email_configuration() -> None:
         subject=f"PhD LitReview Automator — Initialization Test ({datetime.now().strftime('%Y-%m-%d')})",
         html_body=(
             "<h1>PhD LitReview Automator Initialized!</h1>"
-            "<p>The daily pipeline is configured and ready to run.</p>"
-            "<p>You will receive daily reports at this address.</p>"
+            "<p>The pipeline is configured and ready to run.</p>"
+            "<p>You will receive a report at this address after every run.</p>"
         ),
         text_body=(
             "PhD LitReview Automator Initialized!\n\n"
-            "The daily pipeline is configured and ready to run.\n"
-            "You will receive daily reports at this address."
+            "The pipeline is configured and ready to run.\n"
+            "You will receive a report at this address after every run."
         ),
     )
     if sent:
-        console.print(f"[green]✓ Test email sent to {settings.email_to}[/green]")
+        console.print("[green]✓ Test email sent[/green]")
     else:
         console.print("[red]✗ Failed to send test email[/red]")
 
@@ -317,10 +374,15 @@ def main():
     parser.add_argument("--skip-email-test", action="store_true")
     parser.add_argument("--skip-api-test", action="store_true")
     args = parser.parse_args()
+    if args.seed_papers:
+        args.seed_papers = os.path.abspath(args.seed_papers)
+
+    # Resolve .env, storage/ and outputs/ against the project root
+    os.chdir(Path(__file__).resolve().parent.parent)
 
     console.print(Panel(
         "[bold blue]PhD LitReview Automator — Initialization[/bold blue]\n"
-        "Setting up the daily literature review pipeline...",
+        "Setting up the literature review pipeline...",
         border_style="blue"
     ))
 
@@ -335,6 +397,7 @@ def main():
             console.print("[red bold]Anthropic API test failed! Pipeline cannot run without it.[/red bold]")
             sys.exit(1)
         test_semantic_scholar()
+        test_google_docs()
 
     # 3. Initialize database
     console.print("\n[bold]Step 3: Initializing database...[/bold]")
@@ -360,7 +423,8 @@ def main():
         "Next steps:\n"
         "1. Run: [bold]python main.py run --dry-run[/bold] (test without writes)\n"
         "2. Run: [bold]python main.py run[/bold] (full run)\n"
-        "3. Deploy: Push to GitHub — Actions will run daily at 6 AM UTC\n\n"
+        "3. Deploy: add the repository secrets (scripts/setup_github_secrets.sh) —\n"
+        "   GitHub Actions then runs the pipeline every Monday at 06:17 UTC\n\n"
         "Check [bold]python main.py status[/bold] anytime for pipeline statistics.",
         border_style="green"
     ))

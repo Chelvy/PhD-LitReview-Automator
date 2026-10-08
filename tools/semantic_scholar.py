@@ -55,15 +55,18 @@ class SemanticScholarTool:
         year_to: Optional[int] = None,
         fields_of_study: Optional[list[str]] = None,
         open_access_only: bool = False,
+        published_since: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """Full-text paper search."""
+        """Full-text paper search. published_since (YYYY-MM-DD) filters server-side."""
         self._rate_limit()
         params: dict[str, Any] = {
             "query": query,
             "limit": min(limit, 100),
             "fields": PAPER_FIELDS,
         }
-        if year_from or year_to:
+        if published_since:
+            params["publicationDateOrYear"] = f"{published_since}:"
+        elif year_from or year_to:
             y_from = year_from or 2000
             y_to = year_to or datetime.now().year
             params["year"] = f"{y_from}-{y_to}"
@@ -85,6 +88,13 @@ class SemanticScholarTool:
                 logger.info("semantic_scholar_search", query=query, found=len(papers))
                 return [self._normalize_paper(p, query, "semantic_scholar_search") for p in papers]
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400 and published_since:
+                # Fall back to a year filter if the date-range parameter is rejected
+                logger.warning("semantic_scholar_date_filter_rejected", query=query)
+                return self.search_papers.__wrapped__(
+                    self, query=query, limit=limit, year_from=int(published_since[:4]),
+                    fields_of_study=fields_of_study, open_access_only=open_access_only,
+                )
             logger.error("semantic_scholar_http_error", status=e.response.status_code, query=query)
             raise
         except Exception as e:
@@ -179,10 +189,10 @@ class SemanticScholarTool:
         self, query: str, days_back: int = 7, limit: int = 20
     ) -> list[dict[str, Any]]:
         """Search for papers published in the last N days."""
-        cutoff_year = (datetime.now() - timedelta(days=days_back)).year
-        papers = self.search_papers(query=query, limit=limit, year_from=cutoff_year)
-        # Filter by publication date where available
         cutoff = datetime.now() - timedelta(days=days_back)
+        papers = self.search_papers(query=query, limit=limit, published_since=cutoff.strftime("%Y-%m-%d"))
+        # The server filters on publication date (or year when the date is unknown);
+        # drop year-only matches that are clearly older than the window.
         recent = []
         for p in papers:
             pub_date = p.get("publication_date")
@@ -192,7 +202,7 @@ class SemanticScholarTool:
                         recent.append(p)
                 except ValueError:
                     recent.append(p)  # keep if date parsing fails
-            else:
+            elif (p.get("year") or 0) >= cutoff.year:
                 recent.append(p)
         return recent
 
@@ -201,7 +211,7 @@ class SemanticScholarTool:
     ) -> dict[str, Any]:
         """Normalize Semantic Scholar paper to our standard Paper format."""
         external_ids = raw.get("externalIds") or {}
-        authors = [a.get("name", "") for a in (raw.get("authors") or [])]
+        authors = [a.get("name") or "" for a in (raw.get("authors") or [])]
         open_access_pdf = raw.get("openAccessPdf") or {}
 
         paper_id = raw.get("paperId", "")
@@ -214,25 +224,26 @@ class SemanticScholarTool:
             title = raw.get("title", "")
             stable_id = "hash:" + hashlib.md5(title.encode()).hexdigest()[:12]
 
+        # S2 returns explicit nulls (abstract is null for many papers)
         return {
             "paper_id": stable_id,
-            "title": raw.get("title", ""),
-            "authors": authors,
+            "title": raw.get("title") or "",
+            "authors": [a for a in authors if a],
             "year": raw.get("year"),
-            "abstract": raw.get("abstract", ""),
-            "doi": doi,
-            "arxiv_id": arxiv_id,
+            "abstract": raw.get("abstract") or (raw.get("tldr") or {}).get("text") or "",
+            "doi": doi or "",
+            "arxiv_id": arxiv_id or "",
             "semantic_scholar_id": paper_id,
-            "venue": raw.get("venue", "") or (raw.get("journal") or {}).get("name", ""),
-            "citation_count": raw.get("citationCount", 0),
-            "url": raw.get("url", f"https://api.semanticscholar.org/paper/{paper_id}"),
-            "pdf_url": open_access_pdf.get("url", ""),
+            "venue": raw.get("venue") or (raw.get("journal") or {}).get("name") or "",
+            "citation_count": raw.get("citationCount") or 0,
+            "url": raw.get("url") or f"https://www.semanticscholar.org/paper/{paper_id}",
+            "pdf_url": open_access_pdf.get("url") or "",
             "fields_of_study": [
                 f.get("category", "")
                 for f in (raw.get("s2FieldsOfStudy") or [])
             ],
-            "tldr": (raw.get("tldr") or {}).get("text", ""),
-            "publication_date": raw.get("publicationDate", ""),
+            "tldr": (raw.get("tldr") or {}).get("text") or "",
+            "publication_date": raw.get("publicationDate") or "",
             "discovery_source": source,
             "search_query": query,
             "discovery_date": datetime.now().strftime("%Y-%m-%d"),
