@@ -16,6 +16,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import structlog
 
 from config.settings import settings
+from tools.paper_db import strip_markup
 
 logger = structlog.get_logger(__name__)
 
@@ -60,7 +61,9 @@ class CrossRefTool:
         kwargs: dict[str, Any] = {
             "query": query,
             "limit": min(limit, 100),
-            "filter": {"from_pub_date": from_date},
+            # Filter on when the DOI was registered, not the publication date: online-first
+            # articles carry future issue dates and would otherwise match every week.
+            "filter": {"from_created_date": from_date},
             "sort": "relevance",
         }
         if issn:
@@ -73,7 +76,7 @@ class CrossRefTool:
             return [self._normalize(item, query) for item in items if item.get("title")]
         except Exception as e:
             logger.error("crossref_search_error", error=str(e), query=query)
-            return []
+            raise
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=16))
     def get_by_doi(self, doi: str) -> Optional[dict[str, Any]]:
@@ -101,9 +104,9 @@ class CrossRefTool:
         return list(all_papers.values())
 
     def _normalize(self, item: dict[str, Any], query: str) -> dict[str, Any]:
-        doi = item.get("DOI", "")
-        titles = item.get("title", [])
-        title = titles[0] if titles else ""
+        doi = item.get("DOI") or ""
+        titles = item.get("title") or []
+        title = strip_markup(titles[0]) if titles else ""
 
         authors_raw = item.get("author", [])
         authors = []
@@ -116,16 +119,13 @@ class CrossRefTool:
         pub = item.get("published", {})
         date_parts = pub.get("date-parts", [[None]])[0]
         year = date_parts[0] if date_parts else None
-        pub_date = "-".join(str(p) for p in date_parts if p) if date_parts else ""
+        pub_date = "-".join(f"{p:02d}" for p in date_parts if p) if date_parts else ""
 
-        container = item.get("container-title", [])
+        container = item.get("container-title") or []
         venue = container[0] if container else ""
 
-        abstract = item.get("abstract", "")
         # CrossRef abstracts may have JATS XML markup
-        if abstract:
-            import re
-            abstract = re.sub(r"<[^>]+>", " ", abstract).strip()
+        abstract = strip_markup(item.get("abstract"))
 
         stable_id = f"doi:{doi}" if doi else (
             "hash:" + hashlib.md5(title.encode()).hexdigest()[:12]
@@ -141,7 +141,7 @@ class CrossRefTool:
             "arxiv_id": "",
             "semantic_scholar_id": "",
             "venue": venue,
-            "citation_count": item.get("is-referenced-by-count", 0),
+            "citation_count": item.get("is-referenced-by-count") or 0,
             "url": item.get("URL", f"https://doi.org/{doi}"),
             "pdf_url": "",
             "fields_of_study": item.get("subject", []),

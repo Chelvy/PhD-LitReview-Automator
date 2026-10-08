@@ -23,37 +23,46 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from config.settings import settings
 from config.prompts import AgentPrompts
 from state.pipeline_state import PipelineState, SynthesisReport
-from tools.paper_db import PaperDatabase
+from tools.paper_db import Paper, PaperDatabase
 from tools.scite_tool import SciteTool
-from agents.llm_utils import build_llm
+from agents.llm_utils import build_llm, invoke_json, list_field, text_field
 
 logger = structlog.get_logger(__name__)
 
 
-def _build_llm() -> ChatAnthropic:
-    return build_llm(temperature=0.2, max_tokens=16000)
+def _build_llm():
+    return build_llm(temperature=0.2, max_tokens=20000, effort="high")
+
+
+def _score(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _format_papers_for_synthesis(papers: list[dict[str, Any]]) -> str:
     """Format included papers as a structured text block for the synthesis LLM."""
     blocks = []
     for p in papers:
-        gaps = ", ".join(p.get("gaps_addressed", []))
-        tags = ", ".join(p.get("synthesis_tags", []))
+        gaps = ", ".join(str(g) for g in list_field(p, "gaps_addressed"))
+        tags = ", ".join(str(t) for t in list_field(p, "synthesis_tags"))
+        wagner = p.get("wagner_analysis") if isinstance(p.get("wagner_analysis"), dict) else {}
+        contribution = text_field(p, "actual_contribution", "") or text_field(p, "conclusions")
         block = f"""
-PAPER: {p.get('title', 'N/A')} ({p.get('year', 'N/A')})
-Authors: {', '.join(p.get('authors', [])[:4])}
-Venue: {p.get('venue', 'N/A')} | Citations: {p.get('citation_count', 0)}
-Relevance Score: {p.get('relevance_score', 0):.1f}/10 | Gaps: {gaps}
+PAPER: {text_field(p, 'title')} ({text_field(p, 'year')})
+Authors: {', '.join(str(a) for a in list_field(p, 'authors')[:4])}
+Venue: {text_field(p, 'venue')} | Citations: {p.get('citation_count') or 0}
+Relevance Score: {_score(p.get('relevance_score')):.1f}/10 | Gaps: {gaps}
 Tags: {tags}
 
-Research Objectives: {p.get('research_objectives', 'N/A')[:300]}
-Methodology: {p.get('methodology', 'N/A')[:250]}
-Results: {p.get('results', 'N/A')[:300]}
-Actual Contribution: {p.get('actual_contribution', p.get('conclusions', 'N/A'))[:300]}
-Blank Spots (our analysis): {json.dumps(p.get('wagner_analysis', {}).get('blank_spots', [])[:3])}
-Integration Paradox Evidence: {p.get('wagner_analysis', {}).get('integration_paradox_evidence', 'None')}
-Critical Notes: {p.get('critical_notes', 'N/A')}
+Research Objectives: {text_field(p, 'research_objectives', limit=300)}
+Methodology: {text_field(p, 'methodology', limit=250)}
+Results: {text_field(p, 'results', limit=300)}
+Actual Contribution: {contribution[:300]}
+Blank Spots (our analysis): {json.dumps(list_field(wagner, 'blank_spots')[:3], ensure_ascii=False)}
+Integration Paradox Evidence: {wagner.get('integration_paradox_evidence') or 'None'}
+Critical Notes: {text_field(p, 'critical_notes', limit=600)}
 """
         blocks.append(block)
     return "\n---\n".join(blocks)
@@ -177,7 +186,7 @@ Remember:
 Return the full synthesis report as JSON matching this schema:
 {{
   "synthesis_date": "{run_date}",
-  "papers_synthesized": [{json.dumps([p.get('paper_id') for p in included_papers])}],
+  "papers_synthesized": {json.dumps([p.get('paper_id') for p in included_papers])},
   "historical_narrative_update": {{
     "new_developments": "...",
     "timeline_update": "...",
@@ -222,14 +231,13 @@ Return the full synthesis report as JSON matching this schema:
 }}"""
 
     try:
-        response = llm.invoke([system, HumanMessage(content=prompt)])
-        content = response.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-
-        synthesis_report: SynthesisReport = json.loads(content)
+        synthesis_report: SynthesisReport = invoke_json(llm, [system, HumanMessage(content=prompt)])
+        if not isinstance(synthesis_report, dict):
+            raise ValueError(f"Expected a JSON object from synthesis, got {type(synthesis_report).__name__}")
+        # Keep the computed gap counts if the LLM omitted or mangled the gap table
+        if not isinstance(synthesis_report.get("gap_status_update"), dict):
+            synthesis_report["gap_status_update"] = gap_status
+        _record_contradictions(db, synthesis_report)
         logger.info(
             "synthesis_complete",
             papers_synthesized=len(synthesis_report.get("papers_synthesized", [])),
@@ -239,18 +247,45 @@ Return the full synthesis report as JSON matching this schema:
 
     except Exception as e:
         logger.error("synthesis_failed", error=str(e))
-        synthesis_report = {
-            "synthesis_date": run_date,
-            "papers_synthesized": [p.get("paper_id") for p in included_papers],
-            "gap_status_update": gap_status,
-            "historical_narrative_update": {"new_developments": f"Synthesis failed: {e}"},
-            "key_debates_update": [],
-            "contradictions": [],
-            "anchor_papers": [],
-            "methodology_recommendations": [],
-            "contribution_update": "See research questions for contribution statement",
-            "lit_review_sections_to_update": [],
-            "proposal_sections_to_update": [],
+        return {
+            "synthesis_report": _fallback_report(run_date, included_papers, gap_status, e),
+            "synthesis_failed": True,
+            "errors": [{
+                "node": "synthesis",
+                "error": f"Synthesis failed ({str(e)[:300]}); document updates postponed to the next run",
+                "timestamp": datetime.now().isoformat(),
+            }],
         }
 
     return {"synthesis_report": synthesis_report}
+
+
+def _record_contradictions(db: PaperDatabase, report: dict[str, Any]) -> None:
+    """Store detected contradictions on the corpus papers (edges of the citation network)."""
+    for contradiction in list_field(report, "contradictions"):
+        if not isinstance(contradiction, dict):
+            continue
+        ids = [i for i in list_field(contradiction, "papers") if isinstance(i, str)]
+        for paper_id in ids:
+            others = [o for o in ids if o != paper_id]
+            existing = db.corpus.get(Paper.paper_id == paper_id)
+            if existing and others:
+                merged = sorted(set(existing.get("contradicts_papers") or []) | set(others))
+                db.update_corpus_paper(paper_id, {"contradicts_papers": merged})
+
+
+def _fallback_report(run_date: str, included_papers: list[dict[str, Any]], gap_status: dict[str, Any], error: Exception) -> dict[str, Any]:
+    """Minimal synthesis report so the email can still be produced."""
+    return {
+        "synthesis_date": run_date,
+        "papers_synthesized": [p.get("paper_id") for p in included_papers],
+        "gap_status_update": gap_status,
+        "historical_narrative_update": {"new_developments": f"Synthesis failed: {str(error)[:300]}"},
+        "key_debates_update": [],
+        "contradictions": [],
+        "anchor_papers": [],
+        "methodology_recommendations": [],
+        "contribution_update": "See research questions for contribution statement",
+        "lit_review_sections_to_update": [],
+        "proposal_sections_to_update": [],
+    }

@@ -17,7 +17,9 @@ from config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
-ELICIT_BASE = "https://api.elicit.com/v1"
+# api.elicit.com does not resolve; the API is served from elicit.com/api/v1.
+# Endpoint paths and fields below have not been verified against a live key.
+ELICIT_BASE = "https://elicit.com/api/v1"
 
 
 class ElicitTool:

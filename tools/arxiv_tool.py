@@ -7,8 +7,9 @@ Docs: https://info.arxiv.org/help/api/
 from __future__ import annotations
 
 import hashlib
+import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -44,8 +45,32 @@ TARGET_CATEGORIES = [
 ]
 
 
+# Words too generic to narrow an arXiv search (nearly every cs.AI/cs.LG paper matches them)
+_GENERIC_TERMS = {
+    "a", "an", "the", "and", "or", "of", "for", "in", "on", "to", "with", "via", "from", "by",
+    "ai", "ml", "system", "systems", "level", "based", "using", "model", "models", "learning",
+    "machine", "artificial", "intelligence", "deep", "neural", "approach", "study", "analysis",
+}
+
+MAX_QUERY_TERMS = 3
+
+
 def _ns(tag: str, prefix: str = "atom") -> str:
     return f"{{{ARXIV_NS[prefix]}}}{tag}"
+
+
+def _query_terms(query: str) -> list[str]:
+    """Most specific words of a free-text query, in order (arXiv treats bare words as OR)."""
+    words = re.findall(r"[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]", query.lower())
+    terms: list[str] = []
+    for w in words:
+        if w not in _GENERIC_TERMS and len(w) > 2 and w not in terms:
+            terms.append(w)
+    return terms[:MAX_QUERY_TERMS]
+
+
+def _term_clause(terms: list[str]) -> str:
+    return " AND ".join(f'all:"{t}"' if "-" in t else f"all:{t}" for t in terms)
 
 
 class ArxivTool:
@@ -74,23 +99,33 @@ class ArxivTool:
 
         cats = categories or TARGET_CATEGORIES
         cat_filter = " OR ".join(f"cat:{c}" for c in cats)
-        full_query = f"({query}) AND ({cat_filter})"
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(days=days_back)
+        date_filter = f"submittedDate:[{start:%Y%m%d}0000 TO {now:%Y%m%d}2359]"
 
-        params = {
-            "search_query": full_query,
-            "start": 0,
-            "max_results": min(max_results, 100),
-            "sortBy": "submittedDate",
-            "sortOrder": "descending",
-        }
+        terms = _query_terms(query)
+        if not terms:
+            return []
 
-        logger.info("arxiv_search", query=query[:80], max_results=max_results)
+        logger.info("arxiv_search", query=query[:80], terms=terms, max_results=max_results)
 
         try:
-            with httpx.Client(timeout=30.0) as client:
-                resp = client.get(ARXIV_API_BASE, params=params)
-                resp.raise_for_status()
-                papers = self._parse_atom_response(resp.text, query, days_back)
+            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                # AND the most specific terms; if that is too narrow, retry with fewer.
+                for n_terms in sorted({len(terms), min(2, len(terms))}, reverse=True):
+                    params = {
+                        "search_query": f"({_term_clause(terms[:n_terms])}) AND {date_filter} AND ({cat_filter})",
+                        "start": 0,
+                        "max_results": min(max_results, 100),
+                        "sortBy": "relevance",
+                        "sortOrder": "descending",
+                    }
+                    resp = client.get(ARXIV_API_BASE, params=params)
+                    resp.raise_for_status()
+                    papers = self._parse_atom_response(resp.text, query, days_back)
+                    if papers:
+                        break
+                    self._rate_limit()
                 logger.info("arxiv_search_complete", found=len(papers))
                 return papers
         except Exception as e:

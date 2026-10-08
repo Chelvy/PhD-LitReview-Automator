@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Optional
 
@@ -25,15 +26,23 @@ from config.settings import settings
 from config.prompts import AgentPrompts
 from state.pipeline_state import PipelineState
 from tools.scholarcy_tool import ScholarcyTool
-from agents.llm_utils import build_llm
+from agents.llm_utils import build_llm, invoke_json, is_systemic_error, list_field, text_field
 
 logger = structlog.get_logger(__name__)
 
 MAX_ABSTRACT_TOKENS = 3000  # Characters for abstract-only extraction
 
 
-def _build_llm() -> ChatAnthropic:
-    return build_llm(temperature=0.1, max_tokens=8096)
+# Fields that identify a paper. The LLM echoes some of them back, and must not be
+# allowed to change them (a mangled paper_id would defeat de-duplication next run).
+IDENTITY_FIELDS = (
+    "paper_id", "title", "authors", "year", "doi", "arxiv_id", "semantic_scholar_id",
+    "venue", "url", "pdf_url", "citation_count", "discovery_source", "publication_date",
+)
+
+
+def _build_llm():
+    return build_llm(temperature=0.1, max_tokens=16000, effort="medium")
 
 
 def _fetch_pdf_text(pdf_url: str, max_chars: int = 15000) -> Optional[str]:
@@ -90,17 +99,18 @@ def _extract_with_llm(
     system = SystemMessage(content=AgentPrompts.EXTRACTION)
 
     # Build context
-    authors = ", ".join(paper.get("authors", [])[:5])
-    if len(paper.get("authors", [])) > 5:
+    author_list = list_field(paper, "authors")
+    authors = ", ".join(str(a) for a in author_list[:5])
+    if len(author_list) > 5:
         authors += " et al."
 
     context_parts = [
-        f"TITLE: {paper.get('title', 'Unknown')}",
+        f"TITLE: {text_field(paper, 'title', 'Unknown')}",
         f"AUTHORS: {authors}",
-        f"YEAR: {paper.get('year', 'N/A')}",
-        f"VENUE: {paper.get('venue', 'N/A')}",
-        f"CITATION COUNT: {paper.get('citation_count', 0)}",
-        f"ABSTRACT:\n{paper.get('abstract', 'Not available')[:2000]}",
+        f"YEAR: {text_field(paper, 'year')}",
+        f"VENUE: {text_field(paper, 'venue')}",
+        f"CITATION COUNT: {paper.get('citation_count') or 0}",
+        f"ABSTRACT:\n{text_field(paper, 'abstract', 'Not available', limit=2000)}",
     ]
 
     # Add Elicit pre-extraction if available (bonus data)
@@ -109,7 +119,7 @@ def _extract_with_llm(
     if paper.get("elicit_key_findings"):
         context_parts.append(f"ELICIT FINDINGS HINT: {paper['elicit_key_findings']}")
     if paper.get("scholarcy_highlights"):
-        highlights = "\n".join(paper["scholarcy_highlights"][:5])
+        highlights = "\n".join(str(h) for h in list_field(paper, "scholarcy_highlights")[:5])
         context_parts.append(f"\nSCHOLARCY HIGHLIGHTS:\n{highlights}")
 
     if full_text:
@@ -152,34 +162,24 @@ Return a JSON object with ALL of these fields (use null if truly unavailable):
   "quotes": ["Direct quote highly relevant to RQ1/2/3", ...]
 }}"""
 
-    try:
-        response = llm.invoke([system, HumanMessage(content=prompt)])
-        content = response.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
+    extracted = invoke_json(llm, [system, HumanMessage(content=prompt)])
+    if not isinstance(extracted, dict):
+        raise ValueError(f"Expected a JSON object from extraction, got {type(extracted).__name__}")
 
-        extracted = json.loads(content)
-        logger.info("extraction_complete", paper_id=paper.get("paper_id"), method="llm")
-        return extracted
+    # Drop explicit nulls so they don't overwrite metadata, and keep identity fields intact.
+    extracted = {k: v for k, v in extracted.items() if v is not None and k not in IDENTITY_FIELDS}
+    extracted.setdefault("extraction_complete", True)
+    logger.info("paper_extracted", paper_id=paper.get("paper_id"), method="llm", full_text=bool(full_text))
+    return extracted
 
-    except json.JSONDecodeError as e:
-        logger.warning("extraction_json_parse_failed", paper_id=paper.get("paper_id"), error=str(e))
-        return {
-            "paper_id": paper.get("paper_id", ""),
-            "extraction_complete": False,
-            "research_objectives": paper.get("abstract", "")[:500],
-            "methodology": "Extraction failed — manual review required",
-            "results": "",
-            "conclusions": "",
-            "blank_spots": [],
-            "blind_spots": [],
-            "key_contributions": [],
-        }
-    except Exception as e:
-        logger.error("extraction_failed", paper_id=paper.get("paper_id"), error=str(e))
-        return {"paper_id": paper.get("paper_id", ""), "extraction_complete": False}
+
+def _abstract_only_extraction(paper: dict[str, Any]) -> dict[str, Any]:
+    """Minimal extraction used when the LLM step fails, so analysis can still proceed."""
+    return {
+        "extraction_complete": False,
+        "research_objectives": text_field(paper, "abstract", "", limit=500),
+        "methodology": "Extraction failed — manual review required",
+    }
 
 
 def run_extraction(state: PipelineState) -> dict[str, Any]:
@@ -197,12 +197,10 @@ def run_extraction(state: PipelineState) -> dict[str, Any]:
     llm = _build_llm()
     scholarcy = ScholarcyTool()
 
-    extracted_papers = []
-    extraction_errors = []
-
-    for paper in new_papers:
+    def process(paper: dict[str, Any]) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+        """Extract one paper. Returns (paper, error record or None)."""
         paper_id = paper.get("paper_id", "unknown")
-        logger.info("extracting_paper", paper_id=paper_id, title=paper.get("title", "")[:60])
+        logger.info("extracting_paper", paper_id=paper_id, title=text_field(paper, "title", "", limit=60))
 
         try:
             # Step 1: Try Scholarcy for PDF extraction (fast, structured)
@@ -226,26 +224,41 @@ def run_extraction(state: PipelineState) -> dict[str, Any]:
             extraction = _extract_with_llm(llm, enriched_paper, full_text)
 
             # Merge extraction into paper
-            final_paper = {**enriched_paper, **extraction}
-            extracted_papers.append(final_paper)
+            return {**enriched_paper, **extraction}, None
 
         except Exception as e:
             logger.error("paper_extraction_error", paper_id=paper_id, error=str(e))
-            extraction_errors.append({
+            error = {
                 "paper_id": paper_id,
-                "error": str(e),
+                "error": str(e)[:500],
                 "timestamp": datetime.now().isoformat(),
-            })
-            # Still include paper with whatever we have
-            extracted_papers.append({**paper, "extraction_complete": False})
+            }
+            # Still pass the paper on, so critical analysis can work from the abstract
+            return {**paper, **_abstract_only_extraction(paper)}, error
+
+    # Papers are independent: extract several at once (results keep the input order)
+    with ThreadPoolExecutor(max_workers=max(1, settings.llm_concurrency)) as pool:
+        results = list(pool.map(process, new_papers))
+    extracted_papers = [paper for paper, _ in results]
+    extraction_errors = [error for _, error in results if error]
 
     logger.info(
-        "extraction_complete",
-        extracted=len(extracted_papers),
+        "extraction_finished",
+        extracted=len(extracted_papers) - len(extraction_errors),
         errors=len(extraction_errors),
     )
 
-    return {
+    result: dict[str, Any] = {
         "extracted_papers": extracted_papers,
         "extraction_errors": extraction_errors,
     }
+    # Every paper failing points at a systemic problem (API key, model, outage), not bad papers
+    if extraction_errors and len(extraction_errors) == len(new_papers) and (
+        len(new_papers) >= 3 or is_systemic_error(extraction_errors[0]["error"])
+    ):
+        result["errors"] = [{
+            "node": "extraction",
+            "error": f"All {len(new_papers)} extractions failed; first error: {extraction_errors[0]['error']}",
+            "timestamp": datetime.now().isoformat(),
+        }]
+    return result

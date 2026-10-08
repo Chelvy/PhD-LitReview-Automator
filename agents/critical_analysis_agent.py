@@ -12,6 +12,7 @@ analytically grounded, not just keyword-matched.
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
@@ -24,13 +25,28 @@ from config.prompts import AgentPrompts
 from state.pipeline_state import PipelineState
 from tools.paper_db import PaperDatabase
 from tools.scite_tool import SciteTool
-from agents.llm_utils import build_llm
+from agents.llm_utils import build_llm, invoke_json, is_systemic_error, list_field, text_field
 
 logger = structlog.get_logger(__name__)
 
 
-def _build_llm() -> ChatAnthropic:
-    return build_llm(temperature=0.15, max_tokens=8096)
+# The LLM echoes paper_id back; never let analysis output overwrite identity fields.
+IDENTITY_FIELDS = ("paper_id", "title", "authors", "year", "doi", "venue", "citation_count")
+
+
+def _build_llm():
+    return build_llm(temperature=0.15, max_tokens=16000, effort="high")
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _json_list(paper: dict[str, Any], key: str, n: int = 5) -> str:
+    return json.dumps(list_field(paper, key)[:n], ensure_ascii=False)
 
 
 def _analyze_paper(
@@ -45,28 +61,29 @@ def _analyze_paper(
     system = SystemMessage(content=AgentPrompts.CRITICAL_ANALYSIS)
 
     # Build paper summary for the LLM
+    objectives = text_field(paper, "research_objectives", "") or text_field(paper, "abstract")
     paper_text = f"""PAPER TO ANALYZE:
 
-Title: {paper.get('title', 'N/A')}
-Authors: {', '.join(paper.get('authors', [])[:5])}
-Year: {paper.get('year', 'N/A')}
-Venue: {paper.get('venue', 'N/A')} | Citations: {paper.get('citation_count', 0)}
+Title: {text_field(paper, 'title')}
+Authors: {', '.join(str(a) for a in list_field(paper, 'authors')[:5])}
+Year: {text_field(paper, 'year')}
+Venue: {text_field(paper, 'venue')} | Citations: {paper.get('citation_count') or 0}
 
-Preliminary Relevance: {paper.get('preliminary_relevance', 'N/A')}/10
-Pre-screening Reason: {paper.get('preliminary_relevance_reason', 'N/A')}
+Preliminary Relevance: {text_field(paper, 'preliminary_relevance')}/10
+Pre-screening Reason: {text_field(paper, 'preliminary_relevance_reason')}
 
 EXTRACTED DATA:
-Research Objectives: {paper.get('research_objectives', paper.get('abstract', 'N/A'))[:800]}
-Methodology: {paper.get('methodology', 'N/A')[:600]}
-Results: {paper.get('results', 'N/A')[:600]}
-Conclusions: {paper.get('conclusions', 'N/A')[:400]}
-Key Claims: {json.dumps(paper.get('key_claims', [])[:5])}
-Theoretical Contribution: {paper.get('theoretical_contribution', 'N/A')}
-Empirical Contribution: {paper.get('empirical_contribution', 'N/A')}
-Assumptions: {json.dumps(paper.get('assumptions', [])[:5])}
-Author-Acknowledged Limitations (Blind Spots): {json.dumps(paper.get('blind_spots', [])[:5])}
-Pre-extracted Blank Spots: {json.dumps(paper.get('blank_spots', [])[:5])}
-Key Contributions: {json.dumps(paper.get('key_contributions', [])[:5])}
+Research Objectives: {objectives[:800]}
+Methodology: {text_field(paper, 'methodology', limit=600)}
+Results: {text_field(paper, 'results', limit=600)}
+Conclusions: {text_field(paper, 'conclusions', limit=400)}
+Key Claims: {_json_list(paper, 'key_claims')}
+Theoretical Contribution: {text_field(paper, 'theoretical_contribution', limit=600)}
+Empirical Contribution: {text_field(paper, 'empirical_contribution', limit=600)}
+Assumptions: {_json_list(paper, 'assumptions')}
+Author-Acknowledged Limitations (Blind Spots): {_json_list(paper, 'blind_spots')}
+Pre-extracted Blank Spots: {_json_list(paper, 'blank_spots')}
+Key Contributions: {_json_list(paper, 'key_contributions')}
 
 EXISTING CORPUS CONTEXT (for avoiding redundancy):
 {corpus_context[:1000]}
@@ -114,50 +131,16 @@ Return ONLY a JSON object:
   "critical_notes": "2-3 sentence synthesis of why this paper matters (or doesn't) for our research"
 }}"""
 
-    try:
-        response = llm.invoke([system, HumanMessage(content=prompt)])
-        content = response.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-
-        analysis = json.loads(content)
-        logger.info(
-            "paper_analyzed",
-            paper_id=paper.get("paper_id"),
-            score=analysis.get("relevance_score"),
-            include=analysis.get("inclusion_decision"),
-        )
-        return analysis
-
-    except json.JSONDecodeError as e:
-        logger.warning("analysis_parse_failed", paper_id=paper.get("paper_id"), error=str(e))
-        # Fallback: use preliminary score
-        prelim = paper.get("preliminary_relevance", 5.0)
-        return {
-            "paper_id": paper.get("paper_id", ""),
-            "rq1_relevance": prelim * 0.9,
-            "rq2_relevance": prelim * 0.9,
-            "rq3_relevance": prelim * 0.8,
-            "relevance_score": prelim,
-            "inclusion_decision": prelim >= settings.min_relevance_score,
-            "exclusion_reason": None if prelim >= settings.min_relevance_score else "Below relevance threshold (parse error fallback)",
-            "gaps_addressed": [],
-            "wagner_analysis": {
-                "blank_spots": [],
-                "blind_spots": paper.get("blind_spots", []),
-                "actual_contribution": paper.get("abstract", "")[:200],
-                "assumes_component_isolation": True,
-                "integration_paradox_evidence": None,
-            },
-            "synthesis_tags": [],
-            "citation_priority": "medium" if prelim >= 7 else "low",
-            "critical_notes": "Analysis parse failed — manual review recommended",
-        }
-    except Exception as e:
-        logger.error("analysis_error", paper_id=paper.get("paper_id"), error=str(e))
-        raise
+    analysis = invoke_json(llm, [system, HumanMessage(content=prompt)])
+    if not isinstance(analysis, dict):
+        raise ValueError(f"Expected a JSON object from analysis, got {type(analysis).__name__}")
+    logger.info(
+        "paper_analyzed",
+        paper_id=paper.get("paper_id"),
+        score=analysis.get("relevance_score"),
+        include=analysis.get("inclusion_decision"),
+    )
+    return analysis
 
 
 def _build_corpus_context(db: PaperDatabase) -> str:
@@ -171,7 +154,7 @@ def _build_corpus_context(db: PaperDatabase) -> str:
 
     anchor_papers = [
         f"  - {p.get('title', 'Unknown')} ({p.get('year', 'N/A')}) — "
-        f"Score: {p.get('relevance_score', 0):.1f}, Gaps: {p.get('gaps_addressed', [])}"
+        f"Score: {_as_float(p.get('relevance_score'), 0.0):.1f}, Gaps: {list_field(p, 'gaps_addressed')}"
         for p in corpus[:15]  # Show top 15
     ]
 
@@ -210,34 +193,55 @@ def run_critical_analysis(state: PipelineState) -> dict[str, Any]:
     analyzed = []
     included = []
     excluded = []
+    analysis_errors = []
 
-    for paper in extracted_papers:
+    def analyze(paper: dict[str, Any]) -> dict[str, Any]:
+        """Scite signals + LLM analysis for one paper (no database access, safe to run in parallel)."""
+        doi = paper.get("doi", "")
+        if scite.enabled and doi:
+            tally = scite.get_tally(doi)
+            if tally:
+                paper["scite_supporting"] = tally.get("supporting", 0)
+                paper["scite_contrasting"] = tally.get("contrasting", 0)
+                paper["scite_mentioning"] = tally.get("mentioning", 0)
+        return _analyze_paper(llm, paper, corpus_context)
+
+    def analyze_safely(paper: dict[str, Any]) -> Any:
+        try:
+            return analyze(paper)
+        except Exception as e:  # handled per paper below
+            return e
+
+    with ThreadPoolExecutor(max_workers=max(1, settings.llm_concurrency)) as pool:
+        outcomes = list(pool.map(analyze_safely, extracted_papers))
+
+    for paper, outcome in zip(extracted_papers, outcomes):
         paper_id = paper.get("paper_id", "unknown")
 
         try:
-            # Get Scite citation quality signals if available
-            doi = paper.get("doi", "")
-            if scite.enabled and doi:
-                tally = scite.get_tally(doi)
-                if tally:
-                    paper["scite_supporting"] = tally.get("supporting", 0)
-                    paper["scite_contrasting"] = tally.get("contrasting", 0)
-                    paper["scite_mentioning"] = tally.get("mentioning", 0)
-
-            # Run critical analysis
-            analysis = _analyze_paper(llm, paper, corpus_context)
+            if isinstance(outcome, Exception):
+                raise outcome
+            analysis = {k: v for k, v in outcome.items() if k not in IDENTITY_FIELDS}
 
             # Apply citation boost to relevance score
-            citation_count = paper.get("citation_count", 0)
+            citation_count = _as_float(paper.get("citation_count"), 0.0)
             citation_boost = min(
                 settings.relevance_citation_boost * (citation_count / 100),
                 2.0
             )
             adjusted_score = min(
-                analysis.get("relevance_score", 5.0) + citation_boost,
+                _as_float(analysis.get("relevance_score"), 0.0) + citation_boost,
                 10.0
             )
             analysis["relevance_score"] = round(adjusted_score, 2)
+            analysis["inclusion_decision"] = bool(analysis.get("inclusion_decision"))
+            analysis["gaps_addressed"] = [g for g in list_field(analysis, "gaps_addressed") if isinstance(g, str)]
+
+            # Downstream stages (synthesis, documents, email) read these at top level
+            wagner = analysis.get("wagner_analysis") or {}
+            if isinstance(wagner, dict):
+                analysis.setdefault("actual_contribution", wagner.get("actual_contribution") or "")
+                analysis.setdefault("integration_paradox_evidence", wagner.get("integration_paradox_evidence"))
 
             # Override inclusion decision based on adjusted score
             if analysis["relevance_score"] < settings.min_relevance_score:
@@ -248,32 +252,49 @@ def run_critical_analysis(state: PipelineState) -> dict[str, Any]:
                     )
 
             # Merge analysis into paper
-            full_paper = {**paper, **analysis}
+            full_paper = {**paper, **analysis, "analysis_date": datetime.now().strftime("%Y-%m-%d")}
             analyzed.append(full_paper)
 
-            # Persist to database
+            # Persist to database — only successfully analyzed papers, so that a paper
+            # whose analysis failed is picked up again by the next run.
             db.save_paper(full_paper)
-            if full_paper.get("inclusion_decision"):
+            if full_paper["inclusion_decision"]:
                 included.append(full_paper)
                 db.add_to_corpus(full_paper)
             else:
                 excluded.append(full_paper)
-                db.add_to_excluded(full_paper, full_paper.get("exclusion_reason", "Below threshold"))
+                db.add_to_excluded(full_paper, full_paper.get("exclusion_reason") or "Below threshold")
 
         except Exception as e:
             logger.error("paper_analysis_error", paper_id=paper_id, error=str(e))
-            analyzed.append({**paper, "analysis_error": str(e), "inclusion_decision": False})
-            excluded.append(paper)
+            analysis_errors.append({
+                "paper_id": paper_id,
+                "title": text_field(paper, "title", "", limit=120),
+                "error": str(e)[:500],
+                "timestamp": datetime.now().isoformat(),
+            })
 
     logger.info(
         "analysis_complete",
         analyzed=len(analyzed),
         included=len(included),
         excluded=len(excluded),
+        failed=len(analysis_errors),
     )
 
-    return {
+    result: dict[str, Any] = {
         "analyzed_papers": analyzed,
         "included_papers": included,
         "excluded_papers": excluded,
+        "analysis_errors": analysis_errors,
     }
+    # Every paper failing points at a systemic problem (API key, model, outage), not bad papers
+    if analysis_errors and not analyzed and (
+        len(extracted_papers) >= 3 or is_systemic_error(analysis_errors[0]["error"])
+    ):
+        result["errors"] = [{
+            "node": "critical_analysis",
+            "error": f"All {len(extracted_papers)} analyses failed; first error: {analysis_errors[0]['error']}",
+            "timestamp": datetime.now().isoformat(),
+        }]
+    return result

@@ -21,10 +21,19 @@ import structlog
 from config.settings import settings
 from state.pipeline_state import PipelineState, VisualizationData
 from tools.paper_db import PaperDatabase
+from agents.llm_utils import list_field, text_field
 
 logger = structlog.get_logger(__name__)
 
-VIZ_OUTPUT_DIR = Path("outputs/visualizations")
+def _viz_output_dir() -> Path:
+    return Path(settings.outputs_dir) / "visualizations"
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _build_citation_network(
@@ -44,17 +53,19 @@ def _build_citation_network(
             continue
         seen_ids.add(pid)
 
+        citations = _as_int(paper.get("citation_count"))
+        tags = list_field(paper, "synthesis_tags")
         nodes.append({
             "id": pid,
-            "label": paper.get("title", "Unknown")[:50],
-            "year": paper.get("year", 0),
-            "citation_count": paper.get("citation_count", 0),
-            "relevance_score": paper.get("relevance_score", 0.0),
-            "gaps_addressed": paper.get("gaps_addressed", []),
-            "citation_priority": paper.get("citation_priority", "medium"),
+            "label": text_field(paper, "title", "Unknown", limit=50),
+            "year": paper.get("year") or 0,
+            "citation_count": citations,
+            "relevance_score": paper.get("relevance_score") or 0.0,
+            "gaps_addressed": list_field(paper, "gaps_addressed"),
+            "citation_priority": paper.get("citation_priority") or "medium",
             "is_new": pid in new_ids,
-            "size": max(5, min(50, paper.get("citation_count", 0) // 10 + 10)),
-            "group": paper.get("synthesis_tags", ["untagged"])[0] if paper.get("synthesis_tags") else "untagged",
+            "size": max(5, min(50, citations // 10 + 10)),
+            "group": str(tags[0]) if tags else "untagged",
         })
 
         # Add edges from extend/contradict relationships
@@ -122,8 +133,10 @@ def _build_concept_map_mermaid(synthesis_report: dict[str, Any]) -> Visualizatio
         "emerging": "fill:#d4f0cc",
         "growing": "fill:#ccf0d4",
     }
-    for gap_id, gap_data in gaps.items():
-        trajectory = gap_data.get("trajectory", "static")
+    for gap_id, gap_data in (gaps.items() if isinstance(gaps, dict) else []):
+        if not isinstance(gap_data, dict):
+            continue
+        trajectory = str(gap_data.get("trajectory") or "static")
         color = gap_colors.get(trajectory, "fill:#eee")
         count = gap_data.get("papers_addressing", 0)
         mermaid_lines.append(
@@ -159,11 +172,11 @@ def _build_gap_matrix(
     # Count papers per gap and collect key papers
     gap_papers: dict[str, list[str]] = {g: [] for g in gap_ids}
     for paper in corpus:
-        for gap in (paper.get("gaps_addressed") or []):
+        authors = list_field(paper, "authors")
+        first_author = str(authors[0]).split(",")[0] if authors else "Unknown"
+        for gap in list_field(paper, "gaps_addressed"):
             if gap in gap_papers:
-                gap_papers[gap].append(
-                    f"{paper.get('authors', ['?'])[0].split(',')[0]} ({paper.get('year', '?')})"
-                )
+                gap_papers[gap].append(f"{first_author} ({paper.get('year') or '?'})")
 
     # Build Markdown table
     rows = [
@@ -194,7 +207,8 @@ def _build_timeline(corpus: list[dict[str, Any]]) -> VisualizationData:
     for paper in corpus:
         year = paper.get("year")
         if year and isinstance(year, int) and 2010 <= year <= 2030:
-            title = paper.get("title", "Unknown")[:40]
+            # ':' separates events in Mermaid timelines
+            title = text_field(paper, "title", "Unknown", limit=40).replace(":", " -")
             by_year.setdefault(year, []).append(title)
 
     if not by_year:
@@ -259,26 +273,27 @@ def run_visualization(state: PipelineState) -> dict[str, Any]:
 
     # Save to files
     if not settings.dry_run:
-        VIZ_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        viz_dir = _viz_output_dir()
+        viz_dir.mkdir(parents=True, exist_ok=True)
 
         # Citation network JSON
-        network_path = VIZ_OUTPUT_DIR / "citation_network.json"
+        network_path = viz_dir / "citation_network.json"
         network_path.write_text(
             json.dumps(network_viz["data"], indent=2), encoding="utf-8"
         )
 
         # Concept map Mermaid
-        concept_path = VIZ_OUTPUT_DIR / "concept_map.mmd"
+        concept_path = viz_dir / "concept_map.mmd"
         concept_path.write_text(concept_viz.get("mermaid_diagram", ""), encoding="utf-8")
 
         # Gap matrix Markdown
-        gap_path = VIZ_OUTPUT_DIR / "gap_matrix.md"
+        gap_path = viz_dir / "gap_matrix.md"
         gap_path.write_text(gap_viz["data"].get("table_markdown", ""), encoding="utf-8")
 
         # Timeline Mermaid
-        timeline_path = VIZ_OUTPUT_DIR / "timeline.mmd"
+        timeline_path = viz_dir / "timeline.mmd"
         timeline_path.write_text(timeline_viz.get("mermaid_diagram", ""), encoding="utf-8")
 
-        logger.info("visualizations_saved", dir=str(VIZ_OUTPUT_DIR))
+        logger.info("visualizations_saved", dir=str(viz_dir))
 
     return {"visualizations": visualizations}
